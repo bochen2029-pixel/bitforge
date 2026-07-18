@@ -63,6 +63,17 @@ can watch the sweep lock on.
   (Exact / Unchanged / Changed / Increased / Decreased). Double-click a result to jump;
   **Freeze+** holds a value.
 
+## Structure map (entropy + Hilbert)
+
+![structure map](docs/structure-map.png)
+
+The **Map** button renders the current region as a binvis/Veles-style overview: each cell
+is a block of bytes coloured by local Shannon entropy (dark = low / zeros / text, bright =
+high / code / compressed / encrypted), laid out along a **Hilbert curve** so nearby offsets
+stay spatially adjacent and structure blooms into blobs. Press **H** to toggle
+Hilbert/linear, and **click any cell to drill straight down into its bits** — the
+whole-region-to-single-bit zoom. `--map` maps bitforge's own memory as a demo.
+
 ## Build
 
 **One shot (MSVC):**
@@ -86,6 +97,7 @@ build\bitforge_gui.exe <file>     # open a file on launch
 build\bitforge_gui.exe --arecibo  # transmit the Arecibo message into a sandbox
 build\bitforge_gui.exe --seti     # transmit, then run the SETI detector
 build\bitforge_gui.exe --hunt     # SETI@home-style memory-sweep screensaver + alien reply
+build\bitforge_gui.exe --map      # entropy + Hilbert-curve structure overview
 ```
 
 Scriptable proof via the CLI:

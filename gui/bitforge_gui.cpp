@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cmath>
 
 using namespace bf;
 
@@ -37,7 +38,7 @@ enum { LEFTW = 300, BOTH = 172, STATUSH = 40, GAP = 1 };
 enum {
     ID_PROCS = 1001, ID_REGIONS, ID_OPENFILE, ID_REFRESH, ID_RW,
     ID_TYPE, ID_VALUE, ID_FIRST, ID_CMP, ID_NEXT, ID_RESULTS, ID_FREEZE, ID_CLEARFRZ,
-    ID_ARECIBO, ID_SETI, ID_HUNT,
+    ID_ARECIBO, ID_SETI, ID_HUNT, ID_MAP,
     ID_TIMER = 1
 };
 
@@ -45,7 +46,7 @@ enum {
 static HWND  g_main=nullptr, g_procs=nullptr, g_regions=nullptr, g_openfile=nullptr,
              g_refresh=nullptr, g_rw=nullptr, g_type=nullptr, g_value=nullptr,
              g_first=nullptr, g_cmp=nullptr, g_next=nullptr, g_results=nullptr,
-             g_freeze=nullptr, g_clearfrz=nullptr, g_arecibo=nullptr, g_seti=nullptr, g_huntbtn=nullptr;
+             g_freeze=nullptr, g_clearfrz=nullptr, g_arecibo=nullptr, g_seti=nullptr, g_huntbtn=nullptr, g_mapbtn=nullptr;
 static HFONT g_font=nullptr;
 static HBRUSH g_bBg=nullptr, g_b0=nullptr, g_b1=nullptr, g_b0s=nullptr, g_b1s=nullptr, g_bUnk=nullptr;
 static HBRUSH g_heat1=nullptr, g_heat2=nullptr, g_heat3=nullptr;  // recently-flipped bits glow
@@ -62,6 +63,7 @@ static int      g_selBit = 0;      // selected bit within byte (0..7 MSB-first)
 static int      g_cell = 11;       // pixels per bit cell
 static int      g_cols = 64;       // bits per row (multiple of 8)
 static std::vector<uint8_t> g_buf;
+static bool g_hunt=false, g_map=false;   // active overlay mode (else: the bit grid)
 
 struct Frozen { uint64_t addr; int width; uint64_t val; };
 static std::vector<Frozen> g_frozen;
@@ -123,7 +125,7 @@ static void attach_process(uint32_t pid, bool rw){
         MessageBoxA(g_main,m,"bitforge",MB_ICONWARNING); return;
     }
     g_src = std::move(ps); g_scan.bind(g_src.get()); g_scan.reset(); g_frozen.clear();
-    g_cols = 64;
+    g_cols = 64; g_hunt=false; g_map=false;
     refresh_regions();
     if (!g_regionList.empty()) jump_to(g_regionList.front().base);
     SendMessage(g_results, LB_RESETCONTENT, 0, 0); g_shown.clear();
@@ -132,7 +134,7 @@ static void attach_file(const char* path, bool rw){
     auto fs = std::make_unique<FileSource>();
     if (!fs->open(path, rw)){ MessageBoxA(g_main,"CreateFile failed.","bitforge",MB_ICONWARNING); return; }
     g_src = std::move(fs); g_scan.bind(g_src.get()); g_scan.reset(); g_frozen.clear();
-    g_cols = 64;
+    g_cols = 64; g_hunt=false; g_map=false;
     refresh_regions();
     g_view=0; g_selAddr=0; g_selBit=0;
     SendMessage(g_results, LB_RESETCONTENT, 0, 0); g_shown.clear();
@@ -146,6 +148,7 @@ static void do_arecibo(HWND h, bool announce){
     uint64_t base = bs->base();
     bs->write(base, AR_MSG, sizeof(AR_MSG));               // literal bits into our own memory
     g_src = std::move(bs); g_scan.bind(g_src.get()); g_scan.reset(); g_frozen.clear();
+    g_hunt=false; g_map=false;
     refresh_regions();
     SendMessage(g_results, LB_RESETCONTENT, 0, 0); g_shown.clear();
     RECT wr; GetWindowRect(h,&wr);
@@ -221,7 +224,7 @@ static void do_seti(HWND h, bool announce){
 // A SETI@home-style waterfall that sweeps the attached source's memory looking
 // for structured "signals"; when it finds and verifies the real Arecibo message
 // it locks on (CONTACT) and transmits our own alien reply back into memory.
-static bool     g_hunt=false, g_contact=false, g_reply=false;
+static bool     g_contact=false, g_reply=false;
 static uint64_t g_contactAddr=0, g_replyAddr=0;
 static const int HB_BINS=48, HB_HIST=150;               // waterfall bins x history
 static std::vector<uint8_t> g_wf; static int g_wfHead=0;
@@ -354,9 +357,63 @@ static void enter_hunt(){
     g_huntRegion=0; g_huntOff=0; g_huntSwept=0; g_huntChunks=0; g_huntCand=0; g_huntBest=0;
     g_contact=false; g_reply=false; g_wf.assign((size_t)HB_HIST*HB_BINS,0); g_wfHead=0; g_hlogN=0;
     hunt_log("listening... sweeping local memory for structured signals");
-    g_hunt=true; SetWindowTextA(g_main,"bitforge  ::  SETI hunt");
+    g_map=false; g_hunt=true; SetWindowTextA(g_main,"bitforge  ::  SETI hunt");
 }
 static void exit_hunt(){ g_hunt=false; if(g_src) refresh_regions(); InvalidateRect(g_main,nullptr,FALSE); }
+
+// ================= structure map: entropy overview (binvis / Veles style) =================
+// Render a whole region as a 2-D map where each cell is a block of bytes coloured by
+// local Shannon entropy, laid out along a Hilbert curve so nearby offsets stay spatially
+// adjacent (structure blooms into blobs). Click a cell to drill down into its bits.
+static bool     g_mapHilbert=true;
+static const int MAP_N=128;
+static uint64_t g_mapBase=0, g_mapSpan=0, g_mapBlock=1;
+static std::vector<uint8_t> g_mapEnt;
+
+static void hilbert_d2xy(int n,uint32_t d,int&x,int&y){ int rx,ry; uint32_t t=d; x=0; y=0;
+    for(int s=1;s<n;s*=2){ rx=1&(int)(t/2); ry=1&(int)(t^(uint32_t)rx);
+        if(ry==0){ if(rx==1){ x=s-1-x; y=s-1-y; } int tmp=x; x=y; y=tmp; }
+        x+=s*rx; y+=s*ry; t/=4; } }
+static uint32_t hilbert_xy2d(int n,int x,int y){ int rx,ry; uint32_t d=0;
+    for(int s=n/2;s>0;s/=2){ rx=(x&s)>0?1:0; ry=(y&s)>0?1:0; d+=(uint32_t)s*(uint32_t)s*(uint32_t)((3*rx)^ry);
+        if(ry==0){ if(rx==1){ x=s-1-x; y=s-1-y; } int tmp=x; x=y; y=tmp; } } return d; }
+
+static uint8_t buf_entropy(const uint8_t* p,size_t n){ if(!n) return 0; int c[256]; memset(c,0,sizeof(c));
+    for(size_t i=0;i<n;i++) c[p[i]]++; double e=0;
+    for(int i=0;i<256;i++){ if(!c[i]) continue; double pr=(double)c[i]/(double)n; e-=pr*log2(pr); }
+    int v=(int)(e/8.0*255.0); if(v<0)v=0; if(v>255)v=255; return (uint8_t)v; }
+
+static void map_geo(int gw,int gh,int&ox,int&oy,int&cell){ int side=(gw<gh?gw:gh)-40; if(side<MAP_N) side=MAP_N; cell=side/MAP_N; if(cell<1)cell=1; ox=8; oy=30; }
+
+static void enter_map(){
+    if(!g_src) return;
+    auto rs=g_src->regions(); if(rs.empty()) return;
+    Region reg=rs[0]; for(auto&r:rs){ if(g_view>=r.base && g_view<r.base+r.size){ reg=r; break; } }
+    g_mapBase=reg.base; g_mapSpan=reg.size;
+    int cells=MAP_N*MAP_N; g_mapBlock=g_mapSpan/(uint64_t)cells; if(g_mapBlock<1) g_mapBlock=1;
+    g_mapEnt.assign(cells,0);
+    size_t S=(size_t)(g_mapBlock<512?g_mapBlock:512); if(S<1)S=1;
+    std::vector<uint8_t> sb(S);
+    for(int i=0;i<cells;i++){ uint64_t a=g_mapBase+(uint64_t)i*g_mapBlock; size_t got=g_src->read(a,sb.data(),S); g_mapEnt[i]=buf_entropy(sb.data(),got); }
+    g_map=true; g_hunt=false; SetWindowTextA(g_main,"bitforge  ::  structure map");
+}
+static void exit_map(){ g_map=false; if(g_src) refresh_regions(); InvalidateRect(g_main,nullptr,FALSE); }
+
+static void map_render(HDC mem,int gw,int gh){
+    ensure_ramp(); SelectObject(mem,g_font); SetBkMode(mem,TRANSPARENT);
+    int ox,oy,cell; map_geo(gw,gh,ox,oy,cell); int px=cell*MAP_N;
+    for(int d=0;d<MAP_N*MAP_N;d++){ int x,y; if(g_mapHilbert) hilbert_d2xy(MAP_N,(uint32_t)d,x,y); else { x=d%MAP_N; y=d/MAP_N; }
+        int v=g_mapEnt[d]; RECT r={ox+x*cell,oy+y*cell,ox+x*cell+cell,oy+y*cell+cell}; FillRect(mem,&r,g_ramp[v*24/256]); }
+    char t[200]; SetTextColor(mem,RGB(200,220,255));
+    snprintf(t,sizeof(t),"MAP :: entropy  -  %s layout  -  base %011llX  span %.2f MB  block %llu B",
+        g_mapHilbert?"Hilbert":"linear",(unsigned long long)g_mapBase,g_mapSpan/1048576.0,(unsigned long long)g_mapBlock);
+    TextOutA(mem,8,6,t,(int)strlen(t));
+    SetTextColor(mem,RGB(140,150,170));
+    { const char* s="[H] Hilbert/linear     click a cell to drill into its bits     [Esc] exit"; TextOutA(mem,ox,oy+px+8,s,(int)strlen(s)); }
+    int lx=ox+px+24, lw=gw-lx-16;
+    if(lw>48){ for(int i=0;i<24;i++){ RECT r={lx+i*lw/24,oy,lx+(i+1)*lw/24,oy+14}; FillRect(mem,&r,g_ramp[i]); }
+        SetTextColor(mem,RGB(160,170,190)); TextOutA(mem,lx,oy+18,"low  <--  entropy  -->  high",28); }
+}
 
 static void populate_results(){
     SendMessage(g_results, LB_RESETCONTENT, 0, 0);
@@ -424,6 +481,8 @@ static void draw(HWND h, HDC hdc){
 
     if (g_hunt){
         hunt_render(mem, gw, gh);
+    } else if (g_map){
+        map_render(mem, gw, gh);
     } else if (!g_src){
         SetTextColor(mem,RGB(150,150,155));
         { const char* s="Attach a process (left) or Open File, then click bits to toggle them."; TextOutA(mem, 12, 12, s,(int)strlen(s)); }
@@ -534,8 +593,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp){
         g_arecibo =CreateWindowExA(0,"BUTTON","Arecibo",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_ARECIBO,hi,nullptr);
         g_seti    =CreateWindowExA(0,"BUTTON","SETI",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_SETI,hi,nullptr);
         g_huntbtn =CreateWindowExA(0,"BUTTON","Hunt",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_HUNT,hi,nullptr);
+        g_mapbtn  =CreateWindowExA(0,"BUTTON","Map",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_MAP,hi,nullptr);
         g_results =CreateWindowExA(WS_EX_CLIENTEDGE,"LISTBOX",nullptr,WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY,0,0,10,10,h,(HMENU)ID_RESULTS,hi,nullptr);
-        HWND all[]={g_procs,g_refresh,g_rw,g_openfile,g_regions,g_type,g_value,g_first,g_cmp,g_next,g_freeze,g_clearfrz,g_arecibo,g_seti,g_huntbtn,g_results};
+        HWND all[]={g_procs,g_refresh,g_rw,g_openfile,g_regions,g_type,g_value,g_first,g_cmp,g_next,g_freeze,g_clearfrz,g_arecibo,g_seti,g_huntbtn,g_mapbtn,g_results};
         for(HWND c:all) set_font(c);
         for(auto n:{"u8","u16","u32","u64","i8","i16","i32","i64","f32","f64","bits"}) SendMessageA(g_type,CB_ADDSTRING,0,(LPARAM)n);
         SendMessage(g_type,CB_SETCURSEL,2,0); // u32
@@ -563,6 +623,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp){
         MoveWindow(g_arecibo, RX+716,y1,92,24,TRUE);
         MoveWindow(g_seti,    RX+812,y1,72,24,TRUE);
         MoveWindow(g_huntbtn, RX+888,y1,72,24,TRUE);
+        MoveWindow(g_mapbtn,  RX+964,y1,72,24,TRUE);
         MoveWindow(g_results, RX+4, y1+30, W-RX-8, BOTH-40,TRUE);
         InvalidateRect(h,nullptr,FALSE);
         return 0;
@@ -591,6 +652,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp){
         else if(id==ID_ARECIBO && code==BN_CLICKED) do_arecibo(h,true);
         else if(id==ID_SETI    && code==BN_CLICKED) do_seti(h,true);
         else if(id==ID_HUNT    && code==BN_CLICKED){ if(g_hunt) exit_hunt(); else enter_hunt(); }
+        else if(id==ID_MAP     && code==BN_CLICKED){ if(g_map) exit_map(); else enter_map(); }
         else if(id==ID_RESULTS && code==LBN_DBLCLK){
             int i=(int)SendMessage(g_results,LB_GETCURSEL,0,0);
             if(i>=0&&i<(int)g_shown.size()){ jump_to(g_shown[i].addr); g_selBit=g_shown[i].bit; }
@@ -598,6 +660,14 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp){
         return 0;
     }
     case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: {
+        if(g_map && msg==WM_LBUTTONDOWN){
+            Geo g=geo(h); int gw=g.area.right-g.area.left, gh=g.area.bottom-g.area.top; int ox,oy,cell; map_geo(gw,gh,ox,oy,cell);
+            int cx=(GET_X_LPARAM(lp)-g.area.left-ox)/cell, cy=(GET_Y_LPARAM(lp)-g.area.top-oy)/cell;
+            if(cx>=0&&cx<MAP_N&&cy>=0&&cy<MAP_N){ uint32_t d=g_mapHilbert?hilbert_xy2d(MAP_N,cx,cy):(uint32_t)(cy*MAP_N+cx);
+                uint64_t a=g_mapBase+(uint64_t)d*g_mapBlock; g_map=false; g_cols=64; g_view=(a/8)*8; g_selAddr=a; g_selBit=0;
+                if(g_src) refresh_regions(); InvalidateRect(h,nullptr,FALSE); }
+            return 0;
+        }
         uint64_t addr; int bit;
         if(hit_cell(h,GET_X_LPARAM(lp),GET_Y_LPARAM(lp),addr,bit)){
             g_selAddr=addr; g_selBit=bit;
@@ -613,6 +683,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp){
         return 0;
     }
     case WM_KEYDOWN: {
+        if(g_map){ if(wp=='H'){ g_mapHilbert=!g_mapHilbert; InvalidateRect(h,0,FALSE); } else if(wp==VK_ESCAPE) exit_map(); return 0; }
         switch(wp){
             case VK_PRIOR: scroll_rows(h,-8); break;
             case VK_NEXT:  scroll_rows(h, 8); break;
@@ -629,7 +700,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp){
     case WM_TIMER:
         if(wp==ID_TIMER){
             if(g_hunt) hunt_tick(); else apply_frozen();
-            if(g_src||g_hunt){ RECT rc;GetClientRect(h,&rc); RECT gr={RX,4,rc.right,rc.bottom-BOTH-6}; InvalidateRect(h,&gr,FALSE);} }
+            if(g_hunt || (g_src && !g_map)){ RECT rc;GetClientRect(h,&rc); RECT gr={RX,4,rc.right,rc.bottom-BOTH-6}; InvalidateRect(h,&gr,FALSE);} }
         return 0;
     case WM_ERASEBKGND: return 1;   // we paint everything (WS_CLIPCHILDREN)
     case WM_PAINT: { PAINTSTRUCT ps; HDC hdc=BeginPaint(h,&ps); draw(h,hdc); EndPaint(h,&ps); return 0; }
@@ -649,7 +720,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow){
     wc.hbrBackground=(HBRUSH)GetStockObject(BLACK_BRUSH);
     RegisterClassA(&wc);
     g_main=CreateWindowExA(0,"bitforge_wnd","bitforge  -  bit-level viewer/editor",
-        WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN, CW_USEDEFAULT,CW_USEDEFAULT,1300,760,
+        WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN, CW_USEDEFAULT,CW_USEDEFAULT,1400,760,
         nullptr,nullptr,hInst,nullptr);
     ShowWindow(g_main,nShow); UpdateWindow(g_main);
     // Optional launch args:  <pid> | <file> | --arecibo | --seti
@@ -658,6 +729,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow){
         if      (strcmp(a,"--arecibo")==0) do_arecibo(g_main,false);
         else if (strcmp(a,"--seti")==0){ do_arecibo(g_main,false); do_seti(g_main,false); }
         else if (strcmp(a,"--hunt")==0) enter_hunt();
+        else if (strcmp(a,"--map")==0){ attach_process((uint32_t)GetCurrentProcessId(),false); uint64_t bb=0,bsz=0; if(g_src) for(auto&r:g_src->regions()){ if(r.size>bsz){ bsz=r.size; bb=r.base; } } g_view=bb; enter_map(); }
         else {
             bool numeric = *a && strspn(a,"0123456789")==strlen(a);
             if (numeric) attach_process((uint32_t)atoi(a), false);
