@@ -40,7 +40,7 @@ enum { LEFTW = 300, BOTH = 172, STATUSH = 40, GAP = 1 };
 enum {
     ID_PROCS = 1001, ID_REGIONS, ID_OPENFILE, ID_REFRESH, ID_RW,
     ID_TYPE, ID_VALUE, ID_FIRST, ID_CMP, ID_NEXT, ID_RESULTS, ID_FREEZE, ID_CLEARFRZ,
-    ID_ARECIBO, ID_SETI, ID_HUNT, ID_MAP, ID_DISK,
+    ID_ARECIBO, ID_SETI, ID_HUNT, ID_MAP, ID_DISK, ID_ZOOM,
     ID_TIMER = 1
 };
 
@@ -48,7 +48,7 @@ enum {
 static HWND  g_main=nullptr, g_procs=nullptr, g_regions=nullptr, g_openfile=nullptr, g_disk=nullptr,
              g_refresh=nullptr, g_rw=nullptr, g_type=nullptr, g_value=nullptr,
              g_first=nullptr, g_cmp=nullptr, g_next=nullptr, g_results=nullptr,
-             g_freeze=nullptr, g_clearfrz=nullptr, g_arecibo=nullptr, g_seti=nullptr, g_huntbtn=nullptr, g_mapbtn=nullptr;
+             g_freeze=nullptr, g_clearfrz=nullptr, g_arecibo=nullptr, g_seti=nullptr, g_huntbtn=nullptr, g_mapbtn=nullptr, g_zoombtn=nullptr;
 static HFONT g_font=nullptr;
 static HBRUSH g_bBg=nullptr, g_b0=nullptr, g_b1=nullptr, g_b0s=nullptr, g_b1s=nullptr, g_bUnk=nullptr;
 static HBRUSH g_heat1=nullptr, g_heat2=nullptr, g_heat3=nullptr;  // recently-flipped bits glow
@@ -65,7 +65,7 @@ static int      g_selBit = 0;      // selected bit within byte (0..7 MSB-first)
 static int      g_cell = 11;       // pixels per bit cell
 static int      g_cols = 64;       // bits per row (multiple of 8)
 static std::vector<uint8_t> g_buf;
-static bool g_hunt=false, g_map=false;   // active overlay mode (else: the bit grid)
+static bool g_hunt=false, g_map=false, g_zoom=false;   // active overlay mode (else: the bit grid)
 
 struct Frozen { uint64_t addr; int width; uint64_t val; };
 static std::vector<Frozen> g_frozen;
@@ -127,7 +127,7 @@ static void attach_process(uint32_t pid, bool rw){
         MessageBoxA(g_main,m,"bitforge",MB_ICONWARNING); return;
     }
     g_src = std::move(ps); g_scan.bind(g_src.get()); g_scan.reset(); g_frozen.clear();
-    g_cols = 64; g_hunt=false; g_map=false;
+    g_cols = 64; g_hunt=false; g_map=false; g_zoom=false;
     refresh_regions();
     if (!g_regionList.empty()) jump_to(g_regionList.front().base);
     SendMessage(g_results, LB_RESETCONTENT, 0, 0); g_shown.clear();
@@ -136,7 +136,7 @@ static void attach_file(const char* path, bool rw){
     auto fs = std::make_unique<FileSource>();
     if (!fs->open(path, rw)){ MessageBoxA(g_main,"CreateFile failed.","bitforge",MB_ICONWARNING); return; }
     g_src = std::move(fs); g_scan.bind(g_src.get()); g_scan.reset(); g_frozen.clear();
-    g_cols = 64; g_hunt=false; g_map=false;
+    g_cols = 64; g_hunt=false; g_map=false; g_zoom=false;
     refresh_regions();
     g_view=0; g_selAddr=0; g_selBit=0;
     SendMessage(g_results, LB_RESETCONTENT, 0, 0); g_shown.clear();
@@ -149,7 +149,7 @@ static void attach_disk(int index, bool rw){
         MessageBoxA(g_main,m,"bitforge",MB_ICONWARNING); return;
     }
     g_src=std::move(ds); g_scan.bind(g_src.get()); g_scan.reset(); g_frozen.clear();
-    g_cols=64; g_hunt=false; g_map=false;
+    g_cols=64; g_hunt=false; g_map=false; g_zoom=false;
     refresh_regions(); g_view=0; g_selAddr=0; g_selBit=0;
     SendMessage(g_results,LB_RESETCONTENT,0,0); g_shown.clear();
     InvalidateRect(g_main,nullptr,FALSE);
@@ -162,7 +162,7 @@ static void do_arecibo(HWND h, bool announce){
     uint64_t base = bs->base();
     bs->write(base, AR_MSG, sizeof(AR_MSG));               // literal bits into our own memory
     g_src = std::move(bs); g_scan.bind(g_src.get()); g_scan.reset(); g_frozen.clear();
-    g_hunt=false; g_map=false;
+    g_hunt=false; g_map=false; g_zoom=false;
     refresh_regions();
     SendMessage(g_results, LB_RESETCONTENT, 0, 0); g_shown.clear();
     RECT wr; GetWindowRect(h,&wr);
@@ -371,7 +371,7 @@ static void enter_hunt(){
     g_huntRegion=0; g_huntOff=0; g_huntSwept=0; g_huntChunks=0; g_huntCand=0; g_huntBest=0;
     g_contact=false; g_reply=false; g_wf.assign((size_t)HB_HIST*HB_BINS,0); g_wfHead=0; g_hlogN=0;
     hunt_log("listening... sweeping local memory for structured signals");
-    g_map=false; g_hunt=true; SetWindowTextA(g_main,"bitforge  ::  SETI hunt");
+    g_map=false; g_zoom=false; g_hunt=true; SetWindowTextA(g_main,"bitforge  ::  SETI hunt");
 }
 static void exit_hunt(){ g_hunt=false; if(g_src) refresh_regions(); InvalidateRect(g_main,nullptr,FALSE); }
 
@@ -420,7 +420,7 @@ static void enter_map(){
         std::vector<uint8_t> sb((size_t)sample);
         for(int i=0;i<cells;i++){ uint64_t a=g_mapBase+(uint64_t)i*g_mapBlock; size_t got=g_src->read(a,sb.data(),(size_t)sample); g_mapEnt[i]=buf_entropy(sb.data(),got); }
     }
-    g_map=true; g_hunt=false; SetWindowTextA(g_main,"bitforge  ::  structure map");
+    g_map=true; g_hunt=false; g_zoom=false; SetWindowTextA(g_main,"bitforge  ::  structure map");
 }
 static void exit_map(){ g_map=false; if(g_src) refresh_regions(); InvalidateRect(g_main,nullptr,FALSE); }
 
@@ -442,6 +442,58 @@ static void map_render(HDC mem,int gw,int gh){
     int lx=ox+px+24, lw=gw-lx-16;
     if(lw>48){ for(int i=0;i<24;i++){ RECT r={lx+i*lw/24,oy,lx+(i+1)*lw/24,oy+14}; FillRect(mem,&r,g_ramp[i]); }
         SetTextColor(mem,RGB(160,170,190)); TextOutA(mem,lx,oy+18,"low  <--  entropy  -->  high",28); }
+}
+
+// ================= GPU zoom viewer (CUDA renders every pixel; continuous LOD) =================
+static double   g_zoomViewX=0, g_zoomViewY=0;     // top-left bit coordinates (bit units)
+static float    g_zoomScale=1.f;                   // pixels per bit
+static int      g_zoomCols=1;
+static uint64_t g_zoomBase=0, g_zoomSpan=0;
+static std::vector<uint32_t> g_zoomPix;
+static bool     g_zdrag=false; static int g_zdpx=0, g_zdpy=0; static double g_zdvx=0, g_zdvy=0;
+
+static void enter_zoom(){
+#ifdef BITFORGE_CUDA
+    if(!g_src || !bf_gpu_present()){ MessageBoxA(g_main,"Zoom needs a source and a CUDA GPU.","bitforge",MB_ICONINFORMATION); return; }
+    auto rs=g_src->regions(); if(rs.empty()) return;
+    Region reg=rs[0]; for(auto&r:rs){ if(g_view>=r.base && g_view<r.base+r.size){ reg=r; break; } }
+    uint64_t span=reg.size; if(span>(512ull<<20)) span=512ull<<20;   // cap to a VRAM-friendly window
+    std::vector<uint8_t> whole((size_t)span,0);
+    size_t got=g_src->read(reg.base,whole.data(),(size_t)span);
+    if(got==0){ MessageBoxA(g_main,"read failed","bitforge",MB_ICONWARNING); return; }
+    bf_gpu_upload(whole.data(),(unsigned long long)got);
+    g_zoomBase=reg.base; g_zoomSpan=got;
+    uint64_t totalBits=(uint64_t)got*8ull;
+    g_zoomCols=(int)sqrt((double)totalBits); if(g_zoomCols<1)g_zoomCols=1;   // squarish fixed 2-D layout
+    RECT rc; GetClientRect(g_main,&rc); int gw=rc.right-4-RX; if(gw<1)gw=1;
+    g_zoomScale=(float)gw/(float)g_zoomCols; if(g_zoomScale<0.02f)g_zoomScale=0.02f;
+    g_zoomViewX=0; g_zoomViewY=0;
+    g_zoom=true; g_hunt=false; g_map=false; SetWindowTextA(g_main,"bitforge  ::  GPU zoom");
+#else
+    MessageBoxA(g_main,"Built without CUDA.","bitforge",MB_ICONINFORMATION);
+#endif
+}
+static void exit_zoom(){
+    g_zoom=false;
+#ifdef BITFORGE_CUDA
+    bf_gpu_free();
+#endif
+    if(g_src) refresh_regions(); InvalidateRect(g_main,nullptr,FALSE);
+}
+static void zoom_render(HDC mem,int gw,int gh){
+#ifdef BITFORGE_CUDA
+    if((int)g_zoomPix.size()<gw*gh) g_zoomPix.assign((size_t)gw*gh,0);
+    bf_gpu_render(g_zoomViewX,g_zoomViewY,g_zoomScale,g_zoomCols,gw,gh,g_zoomPix.data());
+    BITMAPINFO bi; memset(&bi,0,sizeof(bi)); bi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth=gw; bi.bmiHeader.biHeight=-gh; bi.bmiHeader.biPlanes=1; bi.bmiHeader.biBitCount=32; bi.bmiHeader.biCompression=BI_RGB;
+    SetDIBitsToDevice(mem,0,0,gw,gh,0,0,0,gh,g_zoomPix.data(),&bi,DIB_RGB_COLORS);
+    SelectObject(mem,g_font); SetBkMode(mem,TRANSPARENT); SetTextColor(mem,RGB(220,235,255));
+    char t[220]; snprintf(t,sizeof(t),"ZOOM :: GPU-rendered  -  %.3f px/bit  -  base %011llX  span %.2f MB  [wheel = zoom, drag = pan, Esc = exit]",
+        g_zoomScale,(unsigned long long)g_zoomBase,g_zoomSpan/1048576.0);
+    TextOutA(mem,6,4,t,(int)strlen(t));
+#else
+    (void)mem;(void)gw;(void)gh;
+#endif
 }
 
 static void populate_results(){
@@ -510,6 +562,8 @@ static void draw(HWND h, HDC hdc){
 
     if (g_hunt){
         hunt_render(mem, gw, gh);
+    } else if (g_zoom){
+        zoom_render(mem, gw, gh);
     } else if (g_map){
         map_render(mem, gw, gh);
     } else if (!g_src){
@@ -624,8 +678,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp){
         g_seti    =CreateWindowExA(0,"BUTTON","SETI",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_SETI,hi,nullptr);
         g_huntbtn =CreateWindowExA(0,"BUTTON","Hunt",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_HUNT,hi,nullptr);
         g_mapbtn  =CreateWindowExA(0,"BUTTON","Map",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_MAP,hi,nullptr);
+        g_zoombtn =CreateWindowExA(0,"BUTTON","Zoom",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_ZOOM,hi,nullptr);
         g_results =CreateWindowExA(WS_EX_CLIENTEDGE,"LISTBOX",nullptr,WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY,0,0,10,10,h,(HMENU)ID_RESULTS,hi,nullptr);
-        HWND all[]={g_procs,g_refresh,g_rw,g_openfile,g_disk,g_regions,g_type,g_value,g_first,g_cmp,g_next,g_freeze,g_clearfrz,g_arecibo,g_seti,g_huntbtn,g_mapbtn,g_results};
+        HWND all[]={g_procs,g_refresh,g_rw,g_openfile,g_disk,g_regions,g_type,g_value,g_first,g_cmp,g_next,g_freeze,g_clearfrz,g_arecibo,g_seti,g_huntbtn,g_mapbtn,g_zoombtn,g_results};
         for(HWND c:all) set_font(c);
         for(auto n:{"u8","u16","u32","u64","i8","i16","i32","i64","f32","f64","bits"}) SendMessageA(g_type,CB_ADDSTRING,0,(LPARAM)n);
         SendMessage(g_type,CB_SETCURSEL,2,0); // u32
@@ -655,6 +710,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp){
         MoveWindow(g_seti,    RX+812,y1,72,24,TRUE);
         MoveWindow(g_huntbtn, RX+888,y1,72,24,TRUE);
         MoveWindow(g_mapbtn,  RX+964,y1,72,24,TRUE);
+        MoveWindow(g_zoombtn, RX+1040,y1,72,24,TRUE);
         MoveWindow(g_results, RX+4, y1+30, W-RX-8, BOTH-40,TRUE);
         InvalidateRect(h,nullptr,FALSE);
         return 0;
@@ -694,6 +750,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp){
         else if(id==ID_SETI    && code==BN_CLICKED) do_seti(h,true);
         else if(id==ID_HUNT    && code==BN_CLICKED){ if(g_hunt) exit_hunt(); else enter_hunt(); }
         else if(id==ID_MAP     && code==BN_CLICKED){ if(g_map) exit_map(); else enter_map(); }
+        else if(id==ID_ZOOM    && code==BN_CLICKED){ if(g_zoom) exit_zoom(); else enter_zoom(); }
         else if(id==ID_RESULTS && code==LBN_DBLCLK){
             int i=(int)SendMessage(g_results,LB_GETCURSEL,0,0);
             if(i>=0&&i<(int)g_shown.size()){ jump_to(g_shown[i].addr); g_selBit=g_shown[i].bit; }
@@ -701,6 +758,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp){
         return 0;
     }
     case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: {
+        if(g_zoom && msg==WM_LBUTTONDOWN){ g_zdrag=true; g_zdpx=GET_X_LPARAM(lp); g_zdpy=GET_Y_LPARAM(lp); g_zdvx=g_zoomViewX; g_zdvy=g_zoomViewY; SetCapture(h); return 0; }
         if(g_map && msg==WM_LBUTTONDOWN){
             Geo g=geo(h); int gw=g.area.right-g.area.left, gh=g.area.bottom-g.area.top; int ox,oy,cell; map_geo(gw,gh,ox,oy,cell);
             int cx=(GET_X_LPARAM(lp)-g.area.left-ox)/cell, cy=(GET_Y_LPARAM(lp)-g.area.top-oy)/cell;
@@ -719,11 +777,28 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp){
         return 0;
     }
     case WM_MOUSEWHEEL: {
+        if(g_zoom){
+            POINT pt; pt.x=GET_X_LPARAM(lp); pt.y=GET_Y_LPARAM(lp); ScreenToClient(h,&pt);
+            Geo g=geo(h); float cx=(float)(pt.x-g.area.left), cy=(float)(pt.y-g.area.top); if(cx<0)cx=0; if(cy<0)cy=0;
+            float o=g_zoomScale, f=(GET_WHEEL_DELTA_WPARAM(wp)>0)?1.25f:0.8f, ns=o*f;
+            if(ns<0.02f)ns=0.02f; if(ns>64.f)ns=64.f;
+            g_zoomViewX += (double)cx*(1.0/o - 1.0/ns); g_zoomViewY += (double)cy*(1.0/o - 1.0/ns); g_zoomScale=ns;
+            InvalidateRect(h,nullptr,FALSE); return 0;
+        }
         int d=GET_WHEEL_DELTA_WPARAM(wp)/WHEEL_DELTA;
         scroll_rows(h,-d*3);
         return 0;
     }
+    case WM_MOUSEMOVE:
+        if(g_zoom && g_zdrag){ int dx=GET_X_LPARAM(lp)-g_zdpx, dy=GET_Y_LPARAM(lp)-g_zdpy;
+            g_zoomViewX=g_zdvx-(double)dx/g_zoomScale; g_zoomViewY=g_zdvy-(double)dy/g_zoomScale;
+            RECT rc;GetClientRect(h,&rc); RECT gr={RX,4,rc.right,rc.bottom-BOTH-6}; InvalidateRect(h,&gr,FALSE); }
+        return 0;
+    case WM_LBUTTONUP:
+        if(g_zoom && g_zdrag){ g_zdrag=false; ReleaseCapture(); }
+        return 0;
     case WM_KEYDOWN: {
+        if(g_zoom){ if(wp==VK_ESCAPE) exit_zoom(); return 0; }
         if(g_map){ if(wp=='H'){ g_mapHilbert=!g_mapHilbert; InvalidateRect(h,0,FALSE); } else if(wp==VK_ESCAPE) exit_map(); return 0; }
         switch(wp){
             case VK_PRIOR: scroll_rows(h,-8); break;
@@ -741,7 +816,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp){
     case WM_TIMER:
         if(wp==ID_TIMER){
             if(g_hunt) hunt_tick(); else apply_frozen();
-            if(g_hunt || (g_src && !g_map)){ RECT rc;GetClientRect(h,&rc); RECT gr={RX,4,rc.right,rc.bottom-BOTH-6}; InvalidateRect(h,&gr,FALSE);} }
+            if(g_hunt || (g_src && !g_map && !g_zoom)){ RECT rc;GetClientRect(h,&rc); RECT gr={RX,4,rc.right,rc.bottom-BOTH-6}; InvalidateRect(h,&gr,FALSE);} }
         return 0;
     case WM_ERASEBKGND: return 1;   // we paint everything (WS_CLIPCHILDREN)
     case WM_PAINT: { PAINTSTRUCT ps; HDC hdc=BeginPaint(h,&ps); draw(h,hdc); EndPaint(h,&ps); return 0; }
@@ -761,7 +836,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow){
     wc.hbrBackground=(HBRUSH)GetStockObject(BLACK_BRUSH);
     RegisterClassA(&wc);
     g_main=CreateWindowExA(0,"bitforge_wnd","bitforge  -  bit-level viewer/editor",
-        WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN, CW_USEDEFAULT,CW_USEDEFAULT,1400,760,
+        WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN, CW_USEDEFAULT,CW_USEDEFAULT,1500,760,
         nullptr,nullptr,hInst,nullptr);
     ShowWindow(g_main,nShow); UpdateWindow(g_main);
     // Optional launch args:  <pid> | <file> | --arecibo | --seti
@@ -772,6 +847,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow){
         else if (strcmp(a,"--hunt")==0) enter_hunt();
         else if (strcmp(a,"--map")==0){ attach_process((uint32_t)GetCurrentProcessId(),false); uint64_t bb=0,bsz=0; if(g_src) for(auto&r:g_src->regions()){ if(r.size>bsz){ bsz=r.size; bb=r.base; } } g_view=bb; enter_map(); }
         else if (strcmp(a,"--disk")==0 && __argc>2){ attach_disk(atoi(__argv[2]),false); }
+        else if (strcmp(a,"--zoom")==0){ attach_process((uint32_t)GetCurrentProcessId(),false); uint64_t bb=0,bsz=0; if(g_src) for(auto&r:g_src->regions()){ if(r.size>bsz){ bsz=r.size; bb=r.base; } } g_view=bb; enter_zoom(); }
         else {
             bool numeric = *a && strspn(a,"0123456789")==strlen(a);
             if (numeric) attach_process((uint32_t)atoi(a), false);

@@ -10,11 +10,13 @@ public class U {
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
   [DllImport("user32.dll")] public static extern bool RedrawWindow(IntPtr h, IntPtr a, IntPtr b, uint f);
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint f);
+  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x,int y,int cx,int cy, uint flags);
 }
 "@
 Add-Type $sig
 $h=[IntPtr]$Hwnd
 [U]::ShowWindow($h,3)  | Out-Null        # SW_MAXIMIZE (clean, un-occluded capture)
+[U]::SetWindowPos($h,[IntPtr](-1),0,0,0,0,0x43) | Out-Null   # HWND_TOPMOST | NOMOVE | NOSIZE | SHOWWINDOW
 [U]::SetForegroundWindow($h) | Out-Null
 [U]::RedrawWindow($h,[IntPtr]::Zero,[IntPtr]::Zero,0x101) | Out-Null  # RDW_INVALIDATE|RDW_UPDATENOW
 Start-Sleep -Milliseconds 500

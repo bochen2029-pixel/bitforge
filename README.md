@@ -110,6 +110,18 @@ build\bitforge_cli.exe gpu                       # show the CUDA device
 build\bitforge_cli.exe gpuscan file.bin 1011?01  # GPU unaligned bit search
 ```
 
+### GPU zoom viewer
+
+| zoomed out (whole region) | zoomed in (single bits) |
+|---|---|
+| ![zoom out](docs/zoom-out.png) | ![zoom in](docs/zoom-in.png) |
+
+The **Zoom** button (or `--zoom`) uploads a region to VRAM and a CUDA kernel renders **every
+displayed pixel** straight from the bytes at the current scale — one bit per block when zoomed
+in, popcount-density heat over a block of bits when zoomed out (continuous level-of-detail).
+No OpenGL context needed; the RGBA frame is blitted with `SetDIBitsToDevice`. Mouse wheel zooms
+to the cursor, drag pans, Esc exits.
+
 ## Build
 
 **One shot (MSVC):**
@@ -135,6 +147,7 @@ build\bitforge_gui.exe --seti     # transmit, then run the SETI detector
 build\bitforge_gui.exe --hunt     # SETI@home-style memory-sweep screensaver + alien reply
 build\bitforge_gui.exe --map      # entropy + Hilbert-curve structure overview
 build\bitforge_gui.exe --disk N   # attach \\.\PhysicalDriveN (read-only; needs admin)
+build\bitforge_gui.exe --zoom     # GPU continuous-LOD zoom viewer (needs CUDA)
 ```
 
 Scriptable proof via the CLI:
@@ -182,9 +195,9 @@ forensics on targets you own — not for defeating anti-cheat or DRM.
 
 ## Roadmap
 
-- **GPU rendering** — the analytics already run on CUDA (see above); next is moving the
-  *rendering* onto the GPU (CUDA↔GL interop) for a smooth continuous-LOD zoom, whole region
-  → single bit, instead of today's discrete Map→grid drill-down.
+- **GPU rendering** — done: a CUDA kernel renders every pixel for the continuous-LOD zoom
+  viewer (see above). A future refinement is CUDA↔GL/Vulkan interop to skip the device→host
+  copy for even higher throughput.
 - **Deepest sources** — a kernel-driver `PhysicalMemory` source and a PCILeech/DMA source,
   behind the same `IByteSource`.
 

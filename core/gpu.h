@@ -18,6 +18,11 @@ extern "C" {
     void        bf_gpu_entropy(const unsigned char* data, unsigned long long n,
                                unsigned long long block, int cells, int sample,
                                unsigned char* out, double* ms_kernel);
+    // GPU rendering (continuous-LOD zoom viewer)
+    void        bf_gpu_upload(const unsigned char* data, unsigned long long n);
+    void        bf_gpu_render(double viewX, double viewY, float scale, int cols,
+                              int W, int H, unsigned int* out);
+    void        bf_gpu_free();
 }
 inline bool bf_gpu_present(){ return bf_gpu_init() > 0; }
 #else

@@ -50,6 +50,38 @@ __global__ void k_entropy(const uint8_t* d, uint64_t n, uint64_t block, int cell
     int v=(int)(e*(255.f/8.f)); out[c]=(uint8_t)(v<0?0:(v>255?255:v));
 }
 
+// GPU rendering: each output pixel is computed straight from the raw bytes at the
+// current zoom -- one bit per block when zoomed in, popcount-density heat over a
+// block of bits when zoomed out (continuous level-of-detail). No OpenGL context;
+// the RGBA image is copied back and blitted with GDI.
+__device__ void dens_heat(float t,int&r,int&g,int&b){   // t 0..1 -> blue..cyan..green..yellow..red
+    t*=4.f;
+    if(t<1.f){ r=0; g=(int)(t*255); b=255; }
+    else if(t<2.f){ r=0; g=255; b=(int)((2.f-t)*255); }
+    else if(t<3.f){ r=(int)((t-2.f)*255); g=255; b=0; }
+    else { r=255; g=(int)((4.f-t)*255); b=0; }
+    if(r<0)r=0; if(g<0)g=0; if(b<0)b=0; if(r>255)r=255; if(g>255)g=255; if(b>255)b=255;
+}
+__global__ void k_render(const uint8_t* d, uint64_t totalBits, float viewX, float viewY,
+                         float scale, int cols, int W, int H, uint32_t* out){
+    int px=blockIdx.x*blockDim.x+threadIdx.x, py=blockIdx.y*blockDim.y+threadIdx.y;
+    if(px>=W||py>=H) return;
+    float bc = viewX + px/scale;                 // fractional bit column
+    float br = viewY + py/scale;                  // fractional bit row
+    int bpp = (scale>=1.f)?1:(int)(1.f/scale+0.5f); if(bpp<1)bpp=1;   // bits per pixel when zoomed out
+    int c0=(int)bc, r0=(int)br, set=0, tot=0;
+    for(int dr=0;dr<bpp;dr++) for(int dc=0;dc<bpp;dc++){
+        int c=c0+dc, r=r0+dr; if(c<0||c>=cols||r<0) continue;
+        uint64_t bi=(uint64_t)r*cols + c; if(bi>=totalBits) continue;
+        set += (d[bi>>3]>>(7-(bi&7)))&1; tot++;
+    }
+    uint32_t color;
+    if(tot==0) color=0xFF101014u;
+    else if(bpp==1) color = set?0xFF2882DCu:0xFF222228u;         // single bit: blue / dark
+    else { float dens=(float)set/tot; int R,G,B; dens_heat(dens,R,G,B); color=0xFF000000u|((uint32_t)R<<16)|((uint32_t)G<<8)|(uint32_t)B; }
+    out[py*W+px]=color;                                          // 0xAARRGGBB == BGRA in memory for a DIB
+}
+
 // ---- host wrappers (C linkage so the C++ side can call them) ----
 extern "C" {
 
@@ -112,6 +144,25 @@ void bf_gpu_entropy(const unsigned char* data, unsigned long long n, unsigned lo
     CK(cudaMemcpy(out,dout,cells,cudaMemcpyDeviceToHost));
     cudaFree(dd); cudaFree(dout); cudaEventDestroy(e0); cudaEventDestroy(e1);
 }
+
+// Persistent device buffers so the zoom viewer re-renders (pan/zoom) without re-uploading.
+static uint8_t*  g_devBuf=nullptr; static unsigned long long g_devN=0;
+static uint32_t* g_devImg=nullptr; static int g_devImgCap=0;
+
+void bf_gpu_upload(const unsigned char* data, unsigned long long n){
+    if(g_devBuf){ cudaFree(g_devBuf); g_devBuf=nullptr; g_devN=0; }
+    if(cudaMalloc(&g_devBuf,n)!=cudaSuccess){ g_devBuf=nullptr; return; }
+    cudaMemcpy(g_devBuf,data,n,cudaMemcpyHostToDevice); g_devN=n;
+}
+void bf_gpu_render(double viewX, double viewY, float scale, int cols, int W, int H, unsigned int* out){
+    if(!g_devBuf || W<=0 || H<=0) return;
+    int need=W*H;
+    if(need>g_devImgCap){ if(g_devImg)cudaFree(g_devImg); if(cudaMalloc(&g_devImg,(size_t)need*4)!=cudaSuccess){ g_devImg=nullptr; g_devImgCap=0; return; } g_devImgCap=need; }
+    dim3 bs(16,16), gs((W+15)/16,(H+15)/16);
+    k_render<<<gs,bs>>>(g_devBuf, g_devN*8ull, (float)viewX,(float)viewY, scale, cols, W, H, g_devImg);
+    cudaMemcpy(out, g_devImg, (size_t)need*4, cudaMemcpyDeviceToHost);
+}
+void bf_gpu_free(){ if(g_devBuf){cudaFree(g_devBuf);g_devBuf=nullptr;g_devN=0;} if(g_devImg){cudaFree(g_devImg);g_devImg=nullptr;g_devImgCap=0;} }
 
 } // extern "C"
 
