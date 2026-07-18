@@ -14,3 +14,8 @@ out/
 # scratch / test artifacts
 toy_out.txt
 test.bin
+*.vhd
+*.vhdx
+mkvhd.txt
+fmtvhd.txt
+detvhd.txt

@@ -16,6 +16,7 @@
 #include "source_ops.h"
 #include "file_source.h"
 #include "process_source.h"
+#include "disk_source.h"
 #include "scanner.h"
 #include "buffer_source.h"
 #include "arecibo.h"
@@ -38,12 +39,12 @@ enum { LEFTW = 300, BOTH = 172, STATUSH = 40, GAP = 1 };
 enum {
     ID_PROCS = 1001, ID_REGIONS, ID_OPENFILE, ID_REFRESH, ID_RW,
     ID_TYPE, ID_VALUE, ID_FIRST, ID_CMP, ID_NEXT, ID_RESULTS, ID_FREEZE, ID_CLEARFRZ,
-    ID_ARECIBO, ID_SETI, ID_HUNT, ID_MAP,
+    ID_ARECIBO, ID_SETI, ID_HUNT, ID_MAP, ID_DISK,
     ID_TIMER = 1
 };
 
 // ---- global state ----
-static HWND  g_main=nullptr, g_procs=nullptr, g_regions=nullptr, g_openfile=nullptr,
+static HWND  g_main=nullptr, g_procs=nullptr, g_regions=nullptr, g_openfile=nullptr, g_disk=nullptr,
              g_refresh=nullptr, g_rw=nullptr, g_type=nullptr, g_value=nullptr,
              g_first=nullptr, g_cmp=nullptr, g_next=nullptr, g_results=nullptr,
              g_freeze=nullptr, g_clearfrz=nullptr, g_arecibo=nullptr, g_seti=nullptr, g_huntbtn=nullptr, g_mapbtn=nullptr;
@@ -138,6 +139,18 @@ static void attach_file(const char* path, bool rw){
     refresh_regions();
     g_view=0; g_selAddr=0; g_selBit=0;
     SendMessage(g_results, LB_RESETCONTENT, 0, 0); g_shown.clear();
+    InvalidateRect(g_main,nullptr,FALSE);
+}
+static void attach_disk(int index, bool rw){
+    auto ds=std::make_unique<DiskSource>();
+    if(!ds->open_drive(index,rw)){
+        char m[176]; snprintf(m,sizeof(m),"Could not open PhysicalDrive%d (err %lu).\nRaw disk access needs Administrator.",index,GetLastError());
+        MessageBoxA(g_main,m,"bitforge",MB_ICONWARNING); return;
+    }
+    g_src=std::move(ds); g_scan.bind(g_src.get()); g_scan.reset(); g_frozen.clear();
+    g_cols=64; g_hunt=false; g_map=false;
+    refresh_regions(); g_view=0; g_selAddr=0; g_selBit=0;
+    SendMessage(g_results,LB_RESETCONTENT,0,0); g_shown.clear();
     InvalidateRect(g_main,nullptr,FALSE);
 }
 
@@ -581,7 +594,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp){
         g_procs   =CreateWindowExA(WS_EX_CLIENTEDGE,"LISTBOX",nullptr,WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY|LBS_USETABSTOPS,0,0,10,10,h,(HMENU)ID_PROCS,hi,nullptr);
         g_refresh =CreateWindowExA(0,"BUTTON","Refresh",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_REFRESH,hi,nullptr);
         g_rw      =CreateWindowExA(0,"BUTTON","writable",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,0,0,10,10,h,(HMENU)ID_RW,hi,nullptr);
-        g_openfile=CreateWindowExA(0,"BUTTON","Open File",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_OPENFILE,hi,nullptr);
+        g_openfile=CreateWindowExA(0,"BUTTON","File",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_OPENFILE,hi,nullptr);
+        g_disk    =CreateWindowExA(0,"BUTTON","Disk",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_DISK,hi,nullptr);
         g_regions =CreateWindowExA(WS_EX_CLIENTEDGE,"LISTBOX",nullptr,WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY,0,0,10,10,h,(HMENU)ID_REGIONS,hi,nullptr);
         g_type    =CreateWindowExA(0,"COMBOBOX",nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,0,0,10,220,h,(HMENU)ID_TYPE,hi,nullptr);
         g_value   =CreateWindowExA(WS_EX_CLIENTEDGE,"EDIT","100",WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL,0,0,10,10,h,(HMENU)ID_VALUE,hi,nullptr);
@@ -595,7 +609,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp){
         g_huntbtn =CreateWindowExA(0,"BUTTON","Hunt",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_HUNT,hi,nullptr);
         g_mapbtn  =CreateWindowExA(0,"BUTTON","Map",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_MAP,hi,nullptr);
         g_results =CreateWindowExA(WS_EX_CLIENTEDGE,"LISTBOX",nullptr,WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY,0,0,10,10,h,(HMENU)ID_RESULTS,hi,nullptr);
-        HWND all[]={g_procs,g_refresh,g_rw,g_openfile,g_regions,g_type,g_value,g_first,g_cmp,g_next,g_freeze,g_clearfrz,g_arecibo,g_seti,g_huntbtn,g_mapbtn,g_results};
+        HWND all[]={g_procs,g_refresh,g_rw,g_openfile,g_disk,g_regions,g_type,g_value,g_first,g_cmp,g_next,g_freeze,g_clearfrz,g_arecibo,g_seti,g_huntbtn,g_mapbtn,g_results};
         for(HWND c:all) set_font(c);
         for(auto n:{"u8","u16","u32","u64","i8","i16","i32","i64","f32","f64","bits"}) SendMessageA(g_type,CB_ADDSTRING,0,(LPARAM)n);
         SendMessage(g_type,CB_SETCURSEL,2,0); // u32
@@ -608,9 +622,10 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp){
     case WM_SIZE: {
         RECT rc; GetClientRect(h,&rc); int W=rc.right,H=rc.bottom;
         MoveWindow(g_procs,   4,20,  LEFTW-8,180,TRUE);
-        MoveWindow(g_refresh, 4,204, 80,24,TRUE);
-        MoveWindow(g_rw,      90,206, 80,20,TRUE);
-        MoveWindow(g_openfile,176,204,LEFTW-180,24,TRUE);
+        MoveWindow(g_refresh, 4,204, 64,24,TRUE);
+        MoveWindow(g_rw,      72,206, 74,20,TRUE);
+        MoveWindow(g_openfile,150,204, 56,24,TRUE);
+        MoveWindow(g_disk,    210,204, 62,24,TRUE);
         MoveWindow(g_regions, 4,252, LEFTW-8, H-256,TRUE);
         int y1=H-BOTH+6;
         MoveWindow(g_type,  RX+4,  y1, 64,220,TRUE);
@@ -644,6 +659,16 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp){
             ofn.lpstrFilter="All files\0*.*\0"; ofn.lpstrFile=path; ofn.nMaxFile=MAX_PATH;
             ofn.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST;
             if(GetOpenFileNameA(&ofn)) attach_file(path, SendMessage(g_rw,BM_GETCHECK,0,0)==BST_CHECKED);
+        }
+        else if(id==ID_DISK && code==BN_CLICKED){
+            auto disks=enum_disks();
+            if(disks.empty()){ MessageBoxA(h,"No physical drives found.","bitforge",MB_ICONINFORMATION); return 0; }
+            HMENU m=CreatePopupMenu(); char item[220];
+            for(auto&d:disks){ snprintf(item,sizeof(item),"PhysicalDrive%d   %s   %.0f MB",d.index,d.model.empty()?"disk":d.model.c_str(),d.size/1048576.0); AppendMenuA(m,MF_STRING,(UINT_PTR)(3000+d.index),item); }
+            POINT pt; GetCursorPos(&pt);
+            int cmd=(int)TrackPopupMenu(m,TPM_RETURNCMD|TPM_LEFTALIGN|TPM_TOPALIGN,pt.x,pt.y,0,h,nullptr);
+            DestroyMenu(m);
+            if(cmd>=3000) attach_disk(cmd-3000, SendMessage(g_rw,BM_GETCHECK,0,0)==BST_CHECKED);
         }
         else if(id==ID_FIRST && code==BN_CLICKED) do_first();
         else if(id==ID_NEXT  && code==BN_CLICKED) do_next();
@@ -730,6 +755,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow){
         else if (strcmp(a,"--seti")==0){ do_arecibo(g_main,false); do_seti(g_main,false); }
         else if (strcmp(a,"--hunt")==0) enter_hunt();
         else if (strcmp(a,"--map")==0){ attach_process((uint32_t)GetCurrentProcessId(),false); uint64_t bb=0,bsz=0; if(g_src) for(auto&r:g_src->regions()){ if(r.size>bsz){ bsz=r.size; bb=r.base; } } g_view=bb; enter_map(); }
+        else if (strcmp(a,"--disk")==0 && __argc>2){ attach_disk(atoi(__argv[2]),false); }
         else {
             bool numeric = *a && strspn(a,"0123456789")==strlen(a);
             if (numeric) attach_process((uint32_t)atoi(a), false);

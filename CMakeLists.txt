@@ -11,7 +11,7 @@ endif()
 add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 include_directories(${CMAKE_SOURCE_DIR}/core)
 
-set(CORE core/process_source.cpp core/scanner.cpp)
+set(CORE core/process_source.cpp core/scanner.cpp core/disk_source.cpp)
 
 # Console harness that proves the engine (IByteSource + bit_span + scanner).
 add_executable(bitforge_cli cli/bitforge_cli.cpp ${CORE})

@@ -14,7 +14,7 @@ set "ROOT=%~dp0"
 set "OUT=%ROOT%build"
 if not exist "%OUT%" mkdir "%OUT%"
 set "CF=/nologo /std:c++17 /O2 /EHsc /W3 /D_CRT_SECURE_NO_WARNINGS /I"%ROOT%core""
-set "CORE=%ROOT%core\process_source.cpp %ROOT%core\scanner.cpp"
+set "CORE=%ROOT%core\process_source.cpp %ROOT%core\scanner.cpp %ROOT%core\disk_source.cpp"
 
 echo === bitforge_cli ===
 cl %CF% "%ROOT%cli\bitforge_cli.cpp" %CORE% /Fe:"%OUT%\bitforge_cli.exe" /Fo:"%OUT%\\" || exit /b 1

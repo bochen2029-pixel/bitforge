@@ -74,6 +74,19 @@ stay spatially adjacent and structure blooms into blobs. Press **H** to toggle
 Hilbert/linear, and **click any cell to drill straight down into its bits** — the
 whole-region-to-single-bit zoom. `--map` maps bitforge's own memory as a demo.
 
+## Raw disk (`\\.\PhysicalDrive`)
+
+![raw disk](docs/disk.png)
+
+The **Disk** button lists physical drives (queryable without admin) and attaches one as an
+`IByteSource`, so the bit grid, scanner, structure map, and even the SETI hunt all work over
+a whole disk. Reads/writes are sector-aligned with an internal read-modify-write, so you
+still edit single **bits**; opening a live disk for writing locks and dismounts its volumes
+first (Windows guards mounted-volume sectors). Raw `\\.\PhysicalDriveN` access needs
+**Administrator** — develop against a disposable **VHDX** (`diskpart create vdisk` +
+`Mount-DiskImage`) so you never risk a real disk. `DiskSource::open_image` also opens a raw
+image file directly (no admin) through the same code path.
+
 ## Build
 
 **One shot (MSVC):**
@@ -98,6 +111,7 @@ build\bitforge_gui.exe --arecibo  # transmit the Arecibo message into a sandbox
 build\bitforge_gui.exe --seti     # transmit, then run the SETI detector
 build\bitforge_gui.exe --hunt     # SETI@home-style memory-sweep screensaver + alien reply
 build\bitforge_gui.exe --map      # entropy + Hilbert-curve structure overview
+build\bitforge_gui.exe --disk N   # attach \\.\PhysicalDriveN (read-only; needs admin)
 ```
 
 Scriptable proof via the CLI:
@@ -107,6 +121,9 @@ build\bitforge_cli.exe scan <pid> u32 100         # find a value
 build\bitforge_cli.exe set  <pid> <addr> u32 1337 # write it
 build\bitforge_cli.exe poke <pid> <addr> 7 0      # clear one bit
 build\bitforge_cli.exe fscan <file> bits 01100100 # unaligned bit search in a file
+build\bitforge_cli.exe disks                      # list physical drives
+build\bitforge_cli.exe dread 2 0x0 512            # read a disk's boot sector (admin)
+build\bitforge_cli.exe dpoke 2 <addr> 7 0         # flip one bit on the raw disk
 ```
 
 ## Architecture — one app, pluggable byte sources
@@ -119,7 +136,8 @@ IByteSource
   ├─ FileSource      a plain file (zero risk)
   ├─ ProcessSource   a live process (OpenProcess / VirtualQueryEx / RPM / WPM)
   ├─ BufferSource    a self-owned VirtualAlloc sandbox (the Arecibo scratch space)
-  └─ (roadmap)       PhysicalDrive · VHDX · kernel PhysicalMemory · PCILeech/DMA
+  ├─ DiskSource      a raw disk \\.\PhysicalDriveN or a disk image (sector-aligned)
+  └─ (roadmap)       kernel PhysicalMemory · PCILeech/DMA
 ```
 
 The `bit_span` (get/set/toggle/popcount/**diff**), the address translator, the scanner,

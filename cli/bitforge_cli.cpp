@@ -7,6 +7,7 @@
 #include "source_ops.h"
 #include "file_source.h"
 #include "process_source.h"
+#include "disk_source.h"
 #include "scanner.h"
 #include <cstdio>
 #include <cstdlib>
@@ -67,7 +68,14 @@ static int usage(){
            "  poke    <pid> <hexaddr> <bit0-7> <0|1>\n"
            "  fread   <file> <hexaddr> <n>\n"
            "  fscan   <file> <type> <value>\n"
-           "  fpoke   <file> <hexaddr> <bit0-7> <0|1>\n");
+           "  fpoke   <file> <hexaddr> <bit0-7> <0|1>\n"
+           "  disks\n"
+           "  dread   <index> <hexaddr> <n>       (raw \\\\.\\PhysicalDriveN, admin)\n"
+           "  dscan   <index> <type> <value>\n"
+           "  dset    <index> <hexaddr> <type> <value>\n"
+           "  dpoke   <index> <hexaddr> <bit0-7> <0|1>\n"
+           "  iread   <image> <hexaddr> <n>       (raw disk image file)\n"
+           "  ipoke   <image> <hexaddr> <bit0-7> <0|1>\n");
     return 1;
 }
 
@@ -132,6 +140,47 @@ int main(int argc, char** argv){
         printf("before: "); hexdump(fs,addr,1);
         bool ok=write_bit(fs,addr,bit,val); printf("write_bit -> %s\n", ok?"ok":"FAIL");
         printf("after:  "); hexdump(fs,addr,1); return 0;
+    }
+    // ---- raw disk commands (\\.\PhysicalDriveN, needs admin) ----
+    if (cmd=="disks"){
+        for(auto& d : enum_disks())
+            printf("PhysicalDrive%d  %-28s  %8.0f MB  %u B/sec\n", d.index, d.model.c_str(), d.size/1048576.0, d.sector);
+        return 0;
+    }
+    if (cmd=="dread" && argc>=5){
+        DiskSource ds; if(!ds.open_drive(atoi(argv[2]),false)){ printf("open failed (err %lu) - needs Administrator\n",GetLastError()); return 1; }
+        printf("[%s]\n", ds.label().c_str()); hexdump(ds, parse_addr(argv[3]), (size_t)atoll(argv[4])); return 0;
+    }
+    if (cmd=="dscan" && argc>=5){
+        DiskSource ds; if(!ds.open_drive(atoi(argv[2]),false)){ printf("open failed (err %lu)\n",GetLastError()); return 1; }
+        VType t; if(!parse_type(argv[3],t)) return usage();
+        Scanner sc; sc.bind(&ds); sc.set_type(t); if(!sc.first_scan(argv[4])){ printf("parse fail\n"); return 1; }
+        print_hits(sc); return 0;
+    }
+    if (cmd=="dset" && argc>=6){
+        DiskSource ds; if(!ds.open_drive(atoi(argv[2]),true)){ printf("open(rw) failed (err %lu) - needs Administrator\n",GetLastError()); return 1; }
+        uint64_t addr=parse_addr(argv[3]); VType t; if(!parse_type(argv[4],t)) return usage();
+        uint64_t v; if(!Scanner::parse_value(t,argv[5],v)){ printf("bad value\n"); return 1; }
+        int w=Scanner::width_of(t); uint8_t buf[8]; for(int i=0;i<w;++i) buf[i]=(uint8_t)(v>>(8*i));
+        size_t put=ds.write(addr,buf,w); printf("wrote %zu/%d bytes\n",put,w); hexdump(ds,addr,w); return 0;
+    }
+    if (cmd=="dpoke" && argc>=6){
+        DiskSource ds; if(!ds.open_drive(atoi(argv[2]),true)){ printf("open(rw) failed (err %lu) - needs Administrator\n",GetLastError()); return 1; }
+        uint64_t addr=parse_addr(argv[3]); int bit=atoi(argv[4]), val=atoi(argv[5]);
+        printf("before: "); hexdump(ds,addr,1);
+        bool ok=write_bit(ds,addr,bit,val); printf("write_bit -> %s\n", ok?"ok":"FAIL");
+        printf("after:  "); hexdump(ds,addr,1); return 0;
+    }
+    if (cmd=="iread" && argc>=5){
+        DiskSource ds; if(!ds.open_image(argv[2],false)){ printf("open failed\n"); return 1; }
+        hexdump(ds, parse_addr(argv[3]), (size_t)atoll(argv[4])); return 0;
+    }
+    if (cmd=="ipoke" && argc>=6){
+        DiskSource ds; if(!ds.open_image(argv[2],true)){ printf("open(rw) failed\n"); return 1; }
+        uint64_t addr=parse_addr(argv[3]); int bit=atoi(argv[4]), val=atoi(argv[5]);
+        printf("before: "); hexdump(ds,addr,1);
+        bool ok=write_bit(ds,addr,bit,val); printf("write_bit -> %s\n", ok?"ok":"FAIL");
+        printf("after:  "); hexdump(ds,addr,1); return 0;
     }
     return usage();
 }
