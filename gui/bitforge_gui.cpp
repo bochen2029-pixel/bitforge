@@ -19,6 +19,7 @@
 #include "scanner.h"
 #include "buffer_source.h"
 #include "arecibo.h"
+#include "alien.h"
 #include <memory>
 #include <vector>
 #include <string>
@@ -36,7 +37,7 @@ enum { LEFTW = 300, BOTH = 172, STATUSH = 40, GAP = 1 };
 enum {
     ID_PROCS = 1001, ID_REGIONS, ID_OPENFILE, ID_REFRESH, ID_RW,
     ID_TYPE, ID_VALUE, ID_FIRST, ID_CMP, ID_NEXT, ID_RESULTS, ID_FREEZE, ID_CLEARFRZ,
-    ID_ARECIBO, ID_SETI,
+    ID_ARECIBO, ID_SETI, ID_HUNT,
     ID_TIMER = 1
 };
 
@@ -44,7 +45,7 @@ enum {
 static HWND  g_main=nullptr, g_procs=nullptr, g_regions=nullptr, g_openfile=nullptr,
              g_refresh=nullptr, g_rw=nullptr, g_type=nullptr, g_value=nullptr,
              g_first=nullptr, g_cmp=nullptr, g_next=nullptr, g_results=nullptr,
-             g_freeze=nullptr, g_clearfrz=nullptr, g_arecibo=nullptr, g_seti=nullptr;
+             g_freeze=nullptr, g_clearfrz=nullptr, g_arecibo=nullptr, g_seti=nullptr, g_huntbtn=nullptr;
 static HFONT g_font=nullptr;
 static HBRUSH g_bBg=nullptr, g_b0=nullptr, g_b1=nullptr, g_b0s=nullptr, g_b1s=nullptr, g_bUnk=nullptr;
 static HBRUSH g_heat1=nullptr, g_heat2=nullptr, g_heat3=nullptr;  // recently-flipped bits glow
@@ -216,6 +217,147 @@ static void do_seti(HWND h, bool announce){
     }
 }
 
+// ================= SETI hunt: a memory-sweeping screensaver =================
+// A SETI@home-style waterfall that sweeps the attached source's memory looking
+// for structured "signals"; when it finds and verifies the real Arecibo message
+// it locks on (CONTACT) and transmits our own alien reply back into memory.
+static bool     g_hunt=false, g_contact=false, g_reply=false;
+static uint64_t g_contactAddr=0, g_replyAddr=0;
+static const int HB_BINS=48, HB_HIST=150;               // waterfall bins x history
+static std::vector<uint8_t> g_wf; static int g_wfHead=0;
+static uint64_t g_huntTotal=0, g_huntSwept=0, g_huntCurAddr=0, g_huntOff=0;
+static size_t   g_huntRegion=0; static long g_huntChunks=0, g_huntCand=0; static int g_huntBest=0;
+static std::vector<Region> g_huntRegions;
+static char     g_hlog[5][96]; static int g_hlogN=0;
+static HBRUSH   g_ramp[24]={0};
+
+static void heat_ramp(int v,int&r,int&g,int&b){        // v 0..255 -> SETI heat colour
+    if(v<64){ r=0; g=0; b=40+v*3; }
+    else if(v<128){ int t=v-64; r=0; g=t*4; b=255-t*3; }
+    else if(v<192){ int t=v-128; r=t*4; g=255; b=0; }
+    else { int t=v-192; r=255; g=255-t*3; b=t*2; }
+    if(r>255)r=255; if(g>255)g=255; if(g<0)g=0; if(b>255)b=255; if(b<0)b=0;
+}
+static void ensure_ramp(){
+    if(g_ramp[0]) return;
+    for(int i=0;i<24;i++){ int r,g,b; heat_ramp(i*255/23,r,g,b); g_ramp[i]=CreateSolidBrush(RGB(r,g,b)); }
+}
+static void hunt_log(const char* s){
+    if(g_hlogN<5){ strncpy(g_hlog[g_hlogN],s,95); g_hlog[g_hlogN][95]=0; g_hlogN++; }
+    else { for(int i=0;i<4;i++) memcpy(g_hlog[i],g_hlog[i+1],96); strncpy(g_hlog[4],s,95); g_hlog[4][95]=0; }
+}
+static const char* seti_class(uint32_t s){ static const char* k[]={"Gaussian","Pulse","Triplet","Spike"}; return k[s&3]; }
+
+static void on_contact(){
+    char l[96]; snprintf(l,sizeof(l),">>> CONTACT: Arecibo signal @ 0x%llX",(unsigned long long)g_contactAddr); hunt_log(l);
+    unsigned char reply[210]; generate_alien_reply(reply,(uint32_t)(g_contactAddr^0x5e71u));
+    uint64_t rpos=(g_contactAddr + sizeof(AR_MSG) + 4095) & ~(uint64_t)4095;   // next 4K page
+    if(g_src && g_src->write(rpos,reply,sizeof(reply))==sizeof(reply)){
+        g_reply=true; g_replyAddr=rpos;
+        snprintf(l,sizeof(l),"<<< REPLY transmitted @ 0x%llX",(unsigned long long)rpos); hunt_log(l);
+    } else hunt_log("reply held: source is read-only");
+}
+
+static void hunt_tick(){
+    if(g_huntRegions.empty()) return;
+    const int PERTICK=3; const size_t CH=4096;
+    static std::vector<uint8_t> buf;
+    for(int t=0;t<PERTICK;t++){
+        Region& r=g_huntRegions[g_huntRegion];
+        if(g_huntOff>=r.size){ g_huntOff=0; g_huntRegion=(g_huntRegion+1)%g_huntRegions.size(); if(g_huntRegion==0) g_huntSwept=0; continue; }
+        uint64_t addr=r.base+g_huntOff;
+        size_t want=(size_t)((r.size-g_huntOff<CH)?(r.size-g_huntOff):CH);
+        buf.assign(want,0);
+        size_t got=g_src->read(addr,buf.data(),want);
+        g_huntCurAddr=addr;
+        uint8_t spec[HB_BINS];
+        for(int i=0;i<HB_BINS;i++){
+            size_t s=(size_t)i*got/HB_BINS, e=(size_t)(i+1)*got/HB_BINS; uint64_t pc=0;
+            for(size_t k=s;k<e;k++) pc+=popcount8(buf[k]);
+            spec[i]=(e>s)?(uint8_t)(pc*255/((e-s)*8)):0;
+        }
+        memcpy(&g_wf[(size_t)g_wfHead*HB_BINS],spec,HB_BINS); g_wfHead=(g_wfHead+1)%HB_HIST;
+        int sum=0,peak=0; for(int i=0;i<HB_BINS;i++){ sum+=spec[i]; if(spec[i]>peak)peak=spec[i]; }
+        int mean=sum/HB_BINS; int score=peak*10/(mean+1);
+        if(score>g_huntBest) g_huntBest=score;
+        if(score>=16 && (g_huntChunks%13==0)){ char l[96]; snprintf(l,sizeof(l)," candidate: %s @ 0x%llX  power %d",seti_class((uint32_t)(addr>>7)),(unsigned long long)addr,score); hunt_log(l); g_huntCand++; }
+        if(!g_contact){
+            for(size_t b=0;b+8<=got;b++){
+                if(memcmp(&buf[b],AR_MSG+36,8)==0){
+                    uint64_t sb=addr+b; if(sb>=36){ sb-=36; if(arecibo_at(*g_src,sb*8)){ g_contact=true; g_contactAddr=sb; on_contact(); } }
+                    break;
+                }
+            }
+        }
+        g_huntChunks++; g_huntSwept+=want; g_huntOff+=want;
+    }
+}
+
+static void hunt_render(HDC mem,int gw,int gh){
+    ensure_ramp();
+    SelectObject(mem,g_font); SetBkMode(mem,TRANSPARENT);
+    int specH=96, wfTop=specH+20, wfH=gh-wfTop-4; if(wfH<10) wfH=10;
+    int latest=(g_wfHead-1+HB_HIST)%HB_HIST;
+    // power spectrum
+    for(int i=0;i<HB_BINS;i++){
+        int v=g_wf.empty()?0:g_wf[(size_t)latest*HB_BINS+i];
+        int bh=v*specH/255, x0=i*gw/HB_BINS, x1=(i+1)*gw/HB_BINS-1;
+        RECT br={x0,specH-bh,x1,specH}; FillRect(mem,&br,g_ramp[v*24/256]);
+    }
+    { int sx=(int)((g_huntChunks*7)%(gw>0?gw:1)); HPEN pen=CreatePen(PS_SOLID,1,RGB(0,255,120));
+      HGDIOBJ op=SelectObject(mem,pen); MoveToEx(mem,sx,0,0); LineTo(mem,sx,specH); SelectObject(mem,op); DeleteObject(pen); }
+    // waterfall
+    int rowH=wfH/HB_HIST; if(rowH<1) rowH=1;
+    for(int j=0;j<HB_HIST;j++){
+        int ring=(g_wfHead-1-j+HB_HIST*2)%HB_HIST, y0=wfTop+j*rowH;
+        for(int i=0;i<HB_BINS;i++){
+            int v=g_wf.empty()?0:g_wf[(size_t)ring*HB_BINS+i]; if(v<10) continue;
+            RECT cr={i*gw/HB_BINS,y0,(i+1)*gw/HB_BINS,y0+rowH}; FillRect(mem,&cr,g_ramp[v*24/256]);
+        }
+    }
+    // telemetry
+    char t[180]; int pct=g_huntTotal?(int)(g_huntSwept*100/g_huntTotal):0;
+    SetTextColor(mem,RGB(0,255,140));
+    snprintf(t,sizeof(t),"SETI :: hunting %s", g_src?g_src->label().c_str():"nothing"); TextOutA(mem,6,4,t,(int)strlen(t));
+    snprintf(t,sizeof(t),"sweep %011llX   %d%%   chunks %ld   candidates %ld   peak %d",
+             (unsigned long long)g_huntCurAddr,pct,g_huntChunks,g_huntCand,g_huntBest); TextOutA(mem,6,specH+2,t,(int)strlen(t));
+    SetTextColor(mem,RGB(110,210,120));
+    for(int i=0;i<g_hlogN;i++) TextOutA(mem,6, gh-4-(g_hlogN-i)*16, g_hlog[i],(int)strlen(g_hlog[i]));
+    // contact banner
+    if(g_contact){
+        int bw=gw-40,bh=64,bx=20,by=gh/2-52;
+        RECT box={bx,by,bx+bw,by+bh}; HBRUSH bb=CreateSolidBrush(RGB(16,54,20)); FillRect(mem,&box,bb); DeleteObject(bb);
+        HPEN pen=CreatePen(PS_SOLID,2,RGB(0,255,120)); HGDIOBJ op=SelectObject(mem,pen); HGDIOBJ ob=SelectObject(mem,GetStockObject(NULL_BRUSH));
+        Rectangle(mem,bx,by,bx+bw,by+bh); SelectObject(mem,ob); SelectObject(mem,op); DeleteObject(pen);
+        SetTextColor(mem,RGB(140,255,170));
+        snprintf(t,sizeof(t),"  >>> CONTACT -- ARECIBO SIGNAL @ 0x%llX",(unsigned long long)g_contactAddr); TextOutA(mem,bx+10,by+12,t,(int)strlen(t));
+        if(g_reply) snprintf(t,sizeof(t),"  reply transmitted @ 0x%llX  (our own message is now in memory)",(unsigned long long)g_replyAddr);
+        else        snprintf(t,sizeof(t),"  population field decodes to today's Earth: 8,303,169,803");
+        TextOutA(mem,bx+10,by+36,t,(int)strlen(t));
+    }
+}
+
+static void hunt_setup_demo(){                          // 2 MB of noise with a planted Arecibo message
+    auto bs=std::make_unique<BufferSource>();
+    if(!bs->alloc(2u*1024*1024,"SETI hunt space")) return;
+    uint8_t* p=bs->data(); size_t N=2u*1024*1024;
+    uint32_t s=2463534242u; auto rnd=[&](){ s^=s<<13; s^=s>>17; s^=s<<5; return s; };
+    for(size_t i=0;i<N;i++){ uint32_t x=rnd(); p[i]=(uint8_t)((x&1)?((x>>3)&0x0F):((x>>5)&0xFF)); }
+    size_t plant=((size_t)(N*0.68))&~(size_t)4095; memcpy(p+plant,AR_MSG,sizeof(AR_MSG));
+    g_src=std::move(bs); g_scan.bind(g_src.get()); g_scan.reset(); g_frozen.clear(); refresh_regions();
+}
+static void enter_hunt(){
+    if(!g_src) hunt_setup_demo();
+    if(!g_src) return;
+    g_huntRegions=g_src->regions();
+    g_huntTotal=0; for(auto&r:g_huntRegions) g_huntTotal+=r.size;
+    g_huntRegion=0; g_huntOff=0; g_huntSwept=0; g_huntChunks=0; g_huntCand=0; g_huntBest=0;
+    g_contact=false; g_reply=false; g_wf.assign((size_t)HB_HIST*HB_BINS,0); g_wfHead=0; g_hlogN=0;
+    hunt_log("listening... sweeping local memory for structured signals");
+    g_hunt=true; SetWindowTextA(g_main,"bitforge  ::  SETI hunt");
+}
+static void exit_hunt(){ g_hunt=false; if(g_src) refresh_regions(); InvalidateRect(g_main,nullptr,FALSE); }
+
 static void populate_results(){
     SendMessage(g_results, LB_RESETCONTENT, 0, 0);
     g_shown.clear();
@@ -280,7 +422,9 @@ static void draw(HWND h, HDC hdc){
     RECT full={0,0,gw,gh}; FillRect(mem,&full,g_bBg);
     SelectObject(mem,g_font); SetBkMode(mem,TRANSPARENT);
 
-    if (!g_src){
+    if (g_hunt){
+        hunt_render(mem, gw, gh);
+    } else if (!g_src){
         SetTextColor(mem,RGB(150,150,155));
         { const char* s="Attach a process (left) or Open File, then click bits to toggle them."; TextOutA(mem, 12, 12, s,(int)strlen(s)); }
     } else {
@@ -389,8 +533,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp){
         g_clearfrz=CreateWindowExA(0,"BUTTON","Clear frz",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_CLEARFRZ,hi,nullptr);
         g_arecibo =CreateWindowExA(0,"BUTTON","Arecibo",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_ARECIBO,hi,nullptr);
         g_seti    =CreateWindowExA(0,"BUTTON","SETI",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_SETI,hi,nullptr);
+        g_huntbtn =CreateWindowExA(0,"BUTTON","Hunt",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_HUNT,hi,nullptr);
         g_results =CreateWindowExA(WS_EX_CLIENTEDGE,"LISTBOX",nullptr,WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY,0,0,10,10,h,(HMENU)ID_RESULTS,hi,nullptr);
-        HWND all[]={g_procs,g_refresh,g_rw,g_openfile,g_regions,g_type,g_value,g_first,g_cmp,g_next,g_freeze,g_clearfrz,g_arecibo,g_seti,g_results};
+        HWND all[]={g_procs,g_refresh,g_rw,g_openfile,g_regions,g_type,g_value,g_first,g_cmp,g_next,g_freeze,g_clearfrz,g_arecibo,g_seti,g_huntbtn,g_results};
         for(HWND c:all) set_font(c);
         for(auto n:{"u8","u16","u32","u64","i8","i16","i32","i64","f32","f64","bits"}) SendMessageA(g_type,CB_ADDSTRING,0,(LPARAM)n);
         SendMessage(g_type,CB_SETCURSEL,2,0); // u32
@@ -417,6 +562,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp){
         MoveWindow(g_clearfrz,RX+624,y1,84,24,TRUE);
         MoveWindow(g_arecibo, RX+716,y1,92,24,TRUE);
         MoveWindow(g_seti,    RX+812,y1,72,24,TRUE);
+        MoveWindow(g_huntbtn, RX+888,y1,72,24,TRUE);
         MoveWindow(g_results, RX+4, y1+30, W-RX-8, BOTH-40,TRUE);
         InvalidateRect(h,nullptr,FALSE);
         return 0;
@@ -444,6 +590,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp){
         else if(id==ID_CLEARFRZ&&code==BN_CLICKED){ g_frozen.clear(); SetWindowTextA(g_freeze,"Freeze+"); }
         else if(id==ID_ARECIBO && code==BN_CLICKED) do_arecibo(h,true);
         else if(id==ID_SETI    && code==BN_CLICKED) do_seti(h,true);
+        else if(id==ID_HUNT    && code==BN_CLICKED){ if(g_hunt) exit_hunt(); else enter_hunt(); }
         else if(id==ID_RESULTS && code==LBN_DBLCLK){
             int i=(int)SendMessage(g_results,LB_GETCURSEL,0,0);
             if(i>=0&&i<(int)g_shown.size()){ jump_to(g_shown[i].addr); g_selBit=g_shown[i].bit; }
@@ -480,7 +627,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp){
         return 0;
     }
     case WM_TIMER:
-        if(wp==ID_TIMER){ apply_frozen(); if(g_src){ RECT rc;GetClientRect(h,&rc); RECT gr={RX,4,rc.right,rc.bottom-BOTH-6}; InvalidateRect(h,&gr,FALSE);} }
+        if(wp==ID_TIMER){
+            if(g_hunt) hunt_tick(); else apply_frozen();
+            if(g_src||g_hunt){ RECT rc;GetClientRect(h,&rc); RECT gr={RX,4,rc.right,rc.bottom-BOTH-6}; InvalidateRect(h,&gr,FALSE);} }
         return 0;
     case WM_ERASEBKGND: return 1;   // we paint everything (WS_CLIPCHILDREN)
     case WM_PAINT: { PAINTSTRUCT ps; HDC hdc=BeginPaint(h,&ps); draw(h,hdc); EndPaint(h,&ps); return 0; }
@@ -508,6 +657,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow){
         const char* a=__argv[1];
         if      (strcmp(a,"--arecibo")==0) do_arecibo(g_main,false);
         else if (strcmp(a,"--seti")==0){ do_arecibo(g_main,false); do_seti(g_main,false); }
+        else if (strcmp(a,"--hunt")==0) enter_hunt();
         else {
             bool numeric = *a && strspn(a,"0123456789")==strlen(a);
             if (numeric) attach_process((uint32_t)atoi(a), false);

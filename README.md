@@ -33,6 +33,19 @@ Two twists:
   then verifies each candidate is the full 1679-bit message before declaring
   `>>> SIGNAL`. Transmit it, then listen for it — in your own RAM.
 
+### 📡 SETI hunt — a screensaver that searches your own RAM
+
+![SETI hunt](docs/seti-hunt.png)
+
+The **Hunt** button (or `--hunt`) turns bitforge into a SETI@home-style screensaver
+pointed *inward*: a scrolling waterfall spectrogram sweeps the attached source's memory,
+flagging structured "candidate signals" (Gaussian / Pulse / Triplet) as it goes. When it
+finds and verifies a real Arecibo message it locks on with a **CONTACT** banner, then
+transmits bitforge's own procedurally-generated, bilaterally-symmetric **alien reply**
+back into memory ([`core/alien.h`](core/alien.h)). Detect Earth's message in your RAM,
+reply with an alien one. `--hunt` seeds a 2 MB noise field with a planted message so you
+can watch the sweep lock on.
+
 ---
 
 ## The everyday tool
@@ -72,6 +85,7 @@ build\bitforge_gui.exe <pid>      # attach on launch (read-only)
 build\bitforge_gui.exe <file>     # open a file on launch
 build\bitforge_gui.exe --arecibo  # transmit the Arecibo message into a sandbox
 build\bitforge_gui.exe --seti     # transmit, then run the SETI detector
+build\bitforge_gui.exe --hunt     # SETI@home-style memory-sweep screensaver + alien reply
 ```
 
 Scriptable proof via the CLI:

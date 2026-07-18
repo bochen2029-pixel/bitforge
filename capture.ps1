@@ -14,7 +14,7 @@ public class U {
 "@
 Add-Type $sig
 $h=[IntPtr]$Hwnd
-[U]::ShowWindow($h,9)  | Out-Null        # SW_RESTORE
+[U]::ShowWindow($h,3)  | Out-Null        # SW_MAXIMIZE (clean, un-occluded capture)
 [U]::SetForegroundWindow($h) | Out-Null
 [U]::RedrawWindow($h,[IntPtr]::Zero,[IntPtr]::Zero,0x101) | Out-Null  # RDW_INVALIDATE|RDW_UPDATENOW
 Start-Sleep -Milliseconds 500
