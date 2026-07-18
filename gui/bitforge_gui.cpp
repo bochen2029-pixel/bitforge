@@ -1,0 +1,519 @@
+// bitforge - bitforge_gui.cpp
+// Zero-dependency Win32 + GDI bit-level viewer/editor. The Windows-98-defrag
+// aesthetic, but every little square is ONE bit: blue = 1, dark = 0, click to
+// toggle it straight into the live source. Attaches to a process (RPM/WPM) or a
+// file, walks its regions, and drives the same Scanner the CLI proved out.
+//
+// Everything talks to IByteSource, so the disk / VHDX / physical-memory / DMA
+// sources drop in behind the same UI with no changes here.
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <windowsx.h>
+#include <commdlg.h>
+#include "byte_source.h"
+#include "bit_span.h"
+#include "source_ops.h"
+#include "file_source.h"
+#include "process_source.h"
+#include "scanner.h"
+#include "buffer_source.h"
+#include "arecibo.h"
+#include <memory>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+
+using namespace bf;
+
+// ---- layout constants ----
+enum { LEFTW = 300, BOTH = 172, STATUSH = 40, GAP = 1 };
+#define RX (LEFTW + 4)
+
+enum {
+    ID_PROCS = 1001, ID_REGIONS, ID_OPENFILE, ID_REFRESH, ID_RW,
+    ID_TYPE, ID_VALUE, ID_FIRST, ID_CMP, ID_NEXT, ID_RESULTS, ID_FREEZE, ID_CLEARFRZ,
+    ID_ARECIBO, ID_SETI,
+    ID_TIMER = 1
+};
+
+// ---- global state ----
+static HWND  g_main=nullptr, g_procs=nullptr, g_regions=nullptr, g_openfile=nullptr,
+             g_refresh=nullptr, g_rw=nullptr, g_type=nullptr, g_value=nullptr,
+             g_first=nullptr, g_cmp=nullptr, g_next=nullptr, g_results=nullptr,
+             g_freeze=nullptr, g_clearfrz=nullptr, g_arecibo=nullptr, g_seti=nullptr;
+static HFONT g_font=nullptr;
+static HBRUSH g_bBg=nullptr, g_b0=nullptr, g_b1=nullptr, g_b0s=nullptr, g_b1s=nullptr, g_bUnk=nullptr;
+static HBRUSH g_heat1=nullptr, g_heat2=nullptr, g_heat3=nullptr;  // recently-flipped bits glow
+
+static std::unique_ptr<IByteSource> g_src;
+static Scanner                      g_scan;
+static std::vector<ProcInfo>        g_procList;
+static std::vector<Region>          g_regionList;
+static std::vector<Hit>             g_shown;
+
+static uint64_t g_view = 0;        // top byte address of the grid view
+static uint64_t g_selAddr = 0;     // selected byte
+static int      g_selBit = 0;      // selected bit within byte (0..7 MSB-first)
+static int      g_cell = 11;       // pixels per bit cell
+static int      g_cols = 64;       // bits per row (multiple of 8)
+static std::vector<uint8_t> g_buf;
+
+struct Frozen { uint64_t addr; int width; uint64_t val; };
+static std::vector<Frozen> g_frozen;
+
+static const VType kTypes[] = { VType::U8,VType::U16,VType::U32,VType::U64,
+                                VType::I8,VType::I16,VType::I32,VType::I64,
+                                VType::F32,VType::F64,VType::Binary };
+static const Cmp   kCmps[]  = { Cmp::Exact,Cmp::Unchanged,Cmp::Changed,Cmp::Increased,Cmp::Decreased };
+
+// ---- helpers ----
+struct Geo { RECT area; int step, rows, cols, bytesPerRow, cellsBottom; };
+static Geo geo(HWND h){
+    RECT rc; GetClientRect(h,&rc);
+    Geo g; g.area.left=RX; g.area.top=4; g.area.right=rc.right-4; g.area.bottom=rc.bottom-BOTH-6;
+    g.cols=g_cols; g.step=g_cell+GAP; g.cellsBottom=g.area.bottom-STATUSH;
+    g.rows=std::max(1,(int)((g.cellsBottom-g.area.top)/g.step)); g.bytesPerRow=g.cols/8;
+    return g;
+}
+static void set_font(HWND h){ if(h) SendMessage(h,WM_SETFONT,(WPARAM)g_font,TRUE); }
+
+static void refresh_procs(){
+    g_procList = enum_processes();
+    SendMessage(g_procs, LB_RESETCONTENT, 0, 0);
+    char line[300];
+    for (auto& p : g_procList){
+        snprintf(line,sizeof(line),"%6u  %s", p.pid, p.name.c_str());
+        SendMessageA(g_procs, LB_ADDSTRING, 0, (LPARAM)line);
+    }
+}
+static void refresh_regions(){
+    SendMessage(g_regions, LB_RESETCONTENT, 0, 0);
+    g_regionList.clear();
+    if (!g_src) return;
+    g_regionList = g_src->regions();
+    char line[300];
+    for (auto& r : g_regionList){
+        double kb = r.size/1024.0;
+        snprintf(line,sizeof(line),"%-7s %011llX %8.0fK %c%c%c", r.tag.c_str(),
+                 (unsigned long long)r.base, kb,
+                 r.readable?'r':'-', r.writable?'w':'-', r.executable?'x':'-');
+        SendMessageA(g_regions, LB_ADDSTRING, 0, (LPARAM)line);
+    }
+    char cap[160]; snprintf(cap,sizeof(cap),"%zu regions", g_regionList.size());
+    SetWindowTextA(g_main, (std::string("bitforge  -  ")+g_src->label()).c_str());
+}
+static void jump_to(uint64_t addr){
+    Geo g = geo(g_main);
+    uint64_t bpr = g.bytesPerRow ? g.bytesPerRow : 8;
+    g_view = (addr/bpr)*bpr;              // align view to a row boundary
+    if (g_view > bpr* (uint64_t)(g.rows/4)) g_view -= bpr*(uint64_t)(g.rows/4); // center-ish
+    g_selAddr = addr; g_selBit = 0;
+    InvalidateRect(g_main,nullptr,FALSE);
+}
+
+static void attach_process(uint32_t pid, bool rw){
+    auto ps = std::make_unique<ProcessSource>();
+    if (!ps->open(pid, rw)){
+        char m[128]; snprintf(m,sizeof(m),"OpenProcess failed (err %lu).\nTry another process or run elevated.",GetLastError());
+        MessageBoxA(g_main,m,"bitforge",MB_ICONWARNING); return;
+    }
+    g_src = std::move(ps); g_scan.bind(g_src.get()); g_scan.reset(); g_frozen.clear();
+    g_cols = 64;
+    refresh_regions();
+    if (!g_regionList.empty()) jump_to(g_regionList.front().base);
+    SendMessage(g_results, LB_RESETCONTENT, 0, 0); g_shown.clear();
+}
+static void attach_file(const char* path, bool rw){
+    auto fs = std::make_unique<FileSource>();
+    if (!fs->open(path, rw)){ MessageBoxA(g_main,"CreateFile failed.","bitforge",MB_ICONWARNING); return; }
+    g_src = std::move(fs); g_scan.bind(g_src.get()); g_scan.reset(); g_frozen.clear();
+    g_cols = 64;
+    refresh_regions();
+    g_view=0; g_selAddr=0; g_selBit=0;
+    SendMessage(g_results, LB_RESETCONTENT, 0, 0); g_shown.clear();
+    InvalidateRect(g_main,nullptr,FALSE);
+}
+
+// ---- Arecibo easter egg: transmit (write) + SETI (detect) the message ----
+static void do_arecibo(HWND h, bool announce){
+    auto bs = std::make_unique<BufferSource>();
+    if(!bs->alloc(4096,"Arecibo sandbox")){ MessageBoxA(h,"VirtualAlloc failed.","bitforge",MB_ICONWARNING); return; }
+    uint64_t base = bs->base();
+    bs->write(base, AR_MSG, sizeof(AR_MSG));               // literal bits into our own memory
+    g_src = std::move(bs); g_scan.bind(g_src.get()); g_scan.reset(); g_frozen.clear();
+    refresh_regions();
+    SendMessage(g_results, LB_RESETCONTENT, 0, 0); g_shown.clear();
+    RECT wr; GetWindowRect(h,&wr);
+    SetWindowPos(h,nullptr,0,0,wr.right-wr.left,980,SWP_NOMOVE|SWP_NOZORDER);  // tall like the real bitmap
+    RECT rc; GetClientRect(h,&rc);
+    int gh = (int)(rc.bottom-BOTH-6-STATUSH-4);
+    g_cols = AR_COLS;                                      // 23 -> the raw bits ARE the picture
+    g_cell = std::max(4, std::min(16, gh/AR_ROWS - GAP));
+    g_view = base; g_selAddr = base; g_selBit = 0;
+    InvalidateRect(h,nullptr,FALSE);
+    if(announce){
+        char msg[400];
+        snprintf(msg,sizeof(msg),
+          "The Arecibo message now lives as literal bits in a fresh VirtualAlloc sandbox at 0x%llX "
+          "(this process -- perfectly safe).\n\n"
+          "1679 bits, 73 x 23. Population field: 4,292,853,750 (1974)  ->  %llu (2026).\n\n"
+          "The grid is 23 columns wide, so the raw memory bits ARE the picture. Click a cell to edit "
+          "humanity's message -- then hit SETI to listen for it.",
+          (unsigned long long)base,(unsigned long long)AR_POP_NOW);
+        MessageBoxA(h,msg,"bitforge  -  Arecibo easter egg",MB_ICONINFORMATION);
+    }
+}
+
+// Is the full 1679-bit Arecibo message present at absolute bit offset startBit?
+static bool arecibo_at(IByteSource& s, uint64_t startBit){
+    for(int i=0;i<AR_BITS;++i){
+        uint64_t gb = startBit + (uint64_t)i;
+        uint8_t byte; if(s.read(gb>>3,&byte,1)!=1) return false;
+        if(get_bit(&byte, gb&7) != get_bit(AR_MSG,(uint64_t)i)) return false;
+    }
+    return true;
+}
+
+// SETI: bit-search the attached source for a distinctive 64-bit Arecibo signature,
+// then verify each candidate is the whole message before calling it a signal.
+static void do_seti(HWND h, bool announce){
+    if(!g_src){ MessageBoxA(h,"Point the dish somewhere first: attach a process, open a file, or run the Arecibo easter egg.","bitforge - SETI",MB_ICONINFORMATION); return; }
+    const int off = 36;                                    // a dense, distinctive slice
+    char sig[65]; for(int i=0;i<64;++i) sig[i] = get_bit(AR_MSG,(uint64_t)(off*8+i))?'1':'0'; sig[64]=0;
+    g_scan.set_type(VType::Binary);
+    g_scan.first_scan(sig);                                // unaligned bit search
+    size_t echoes = g_scan.count();
+    std::vector<Hit> confirmed;
+    for(const Hit& hh : g_scan.hits()){
+        uint64_t sigBit = hh.addr*8 + (uint64_t)hh.bit;
+        if(sigBit < (uint64_t)off*8) continue;
+        uint64_t startBit = sigBit - (uint64_t)off*8;
+        if(arecibo_at(*g_src, startBit)){
+            Hit c; c.addr = startBit>>3; c.bit = (uint8_t)(startBit&7); c.last = AR_POP_NOW;
+            confirmed.push_back(c);
+        }
+    }
+    SendMessage(g_results, LB_RESETCONTENT, 0, 0); g_shown.clear();
+    char line[128];
+    for(const Hit& c : confirmed){ g_shown.push_back(c);
+        if(c.bit) snprintf(line,sizeof(line),">>> SIGNAL  %011llX.b%u",(unsigned long long)c.addr,c.bit);
+        else      snprintf(line,sizeof(line),">>> SIGNAL  %011llX",(unsigned long long)c.addr);
+        SendMessageA(g_results, LB_ADDSTRING, 0, (LPARAM)line);
+    }
+    if(announce){
+        char msg[380];
+        if(!confirmed.empty())
+            snprintf(msg,sizeof(msg),"SETI scan of %s\n\n%zu confirmed Arecibo transmission(s) detected.\nFirst contact at 0x%llX.\n\nDouble-click a SIGNAL to jump to it.",
+                     g_src->label().c_str(), confirmed.size(), (unsigned long long)confirmed.front().addr);
+        else
+            snprintf(msg,sizeof(msg),"SETI scan of %s\n\nNo Arecibo transmission found (%zu signature echo(es), none verified).\n\nRun the Arecibo easter egg to transmit one, then scan again.",
+                     g_src->label().c_str(), echoes);
+        MessageBoxA(h,msg,"bitforge  -  SETI scanner",MB_ICONINFORMATION);
+    }
+}
+
+static void populate_results(){
+    SendMessage(g_results, LB_RESETCONTENT, 0, 0);
+    g_shown.clear();
+    char line[160];
+    size_t n=0;
+    for (const Hit& h : g_scan.hits()){
+        g_shown.push_back(h);
+        if (h.bit) snprintf(line,sizeof(line),"%011llX.b%u = %llu",(unsigned long long)h.addr,h.bit,(unsigned long long)h.last);
+        else       snprintf(line,sizeof(line),"%011llX = %llu",(unsigned long long)h.addr,(unsigned long long)h.last);
+        SendMessageA(g_results, LB_ADDSTRING, 0, (LPARAM)line);
+        if (++n >= 5000) break;
+    }
+    char cap[96]; snprintf(cap,sizeof(cap),"First Scan  [%zu hits%s]", g_scan.count(), g_scan.truncated()?"+":"");
+    SetWindowTextA(g_first, cap);
+}
+
+static VType cur_type(){ int i=(int)SendMessage(g_type,CB_GETCURSEL,0,0); if(i<0)i=2; return kTypes[i]; }
+static Cmp   cur_cmp (){ int i=(int)SendMessage(g_cmp,CB_GETCURSEL,0,0); if(i<0)i=0; return kCmps[i]; }
+static std::string edit_text(){ char b[128]; GetWindowTextA(g_value,b,sizeof(b)); return b; }
+
+static void do_first(){
+    if(!g_src){ MessageBoxA(g_main,"Attach a process or open a file first.","bitforge",MB_ICONINFORMATION); return; }
+    g_scan.set_type(cur_type());
+    if(!g_scan.first_scan(edit_text())){ MessageBoxA(g_main,"Bad value/pattern for this type.","bitforge",MB_ICONWARNING); return; }
+    populate_results();
+}
+static void do_next(){
+    if(!g_src) return;
+    g_scan.next_scan(cur_cmp(), edit_text());
+    populate_results();
+    char cap[96]; snprintf(cap,sizeof(cap),"Next Scan  [%zu]", g_scan.count()); SetWindowTextA(g_next,cap);
+}
+static void do_freeze(){
+    int idx=(int)SendMessage(g_results,LB_GETCURSEL,0,0);
+    if(idx<0||idx>=(int)g_shown.size()) return;
+    Hit h=g_shown[idx]; uint64_t v; if(!g_scan.read_value(h,v)) return;
+    int w=Scanner::width_of(g_scan.type()); if(w<=0) return;   // numeric only
+    g_frozen.push_back(Frozen{h.addr,w,v});
+    char cap[64]; snprintf(cap,sizeof(cap),"Freeze+ [%zu]",g_frozen.size()); SetWindowTextA(g_freeze,cap);
+}
+static void apply_frozen(){
+    if(!g_src) return;
+    for(auto&f:g_frozen){ uint8_t b[8]; for(int i=0;i<f.width;++i) b[i]=(uint8_t)(f.val>>(8*i)); g_src->write(f.addr,b,f.width); }
+}
+
+// ---- grid rendering ----
+static void draw(HWND h, HDC hdc){
+    RECT rc; GetClientRect(h,&rc);
+    // parent background (WS_CLIPCHILDREN keeps controls safe)
+    FillRect(hdc, &rc, g_bBg);
+    SelectObject(hdc, g_font); SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, RGB(200,200,205));
+    { const char* s="Processes  (dbl-click = attach)"; TextOutA(hdc, 6, 4,   s,(int)strlen(s)); }
+    { const char* s="Regions  (click = jump)";         TextOutA(hdc, 6, 236, s,(int)strlen(s)); }
+
+    Geo g = geo(h);
+    int gw=g.area.right-g.area.left, gh=g.area.bottom-g.area.top;
+    if (gw<10||gh<10) return;
+
+    // offscreen buffer for the whole grid area (no flicker)
+    HDC mem=CreateCompatibleDC(hdc); HBITMAP bmp=CreateCompatibleBitmap(hdc,gw,gh);
+    HBITMAP old=(HBITMAP)SelectObject(mem,bmp);
+    RECT full={0,0,gw,gh}; FillRect(mem,&full,g_bBg);
+    SelectObject(mem,g_font); SetBkMode(mem,TRANSPARENT);
+
+    if (!g_src){
+        SetTextColor(mem,RGB(150,150,155));
+        { const char* s="Attach a process (left) or Open File, then click bits to toggle them."; TextOutA(mem, 12, 12, s,(int)strlen(s)); }
+    } else {
+        int nbytes = (g.rows*g.cols + 7)/8;   // works for any cols (e.g. 23 for Arecibo)
+        g_buf.assign(nbytes,0);
+        size_t got = g_src->read(g_view, g_buf.data(), nbytes);
+
+        // live change-heat: bits that flipped since the last frame glow, then cool off
+        static std::vector<uint8_t> prevBuf; static std::vector<uint16_t> heat;
+        static uint64_t prevView=~0ull; static int prevCols=0;
+        int totalBits = g.rows*g.cols;
+        if(prevView!=g_view || prevCols!=g.cols || (int)heat.size()!=totalBits){
+            heat.assign(totalBits,0); prevBuf=g_buf; prevView=g_view; prevCols=g.cols;
+        }
+        for(int i=0;i<totalBits;++i){
+            int cur=((size_t)(i>>3)<got)? get_bit(g_buf.data(),(uint64_t)i):0;
+            int pv =((size_t)(i>>3)<prevBuf.size())? get_bit(prevBuf.data(),(uint64_t)i):0;
+            if(cur!=pv) heat[i]=28; else if(heat[i]>0) heat[i]--;
+        }
+        prevBuf=g_buf;
+
+        for (int row=0; row<g.rows; ++row){
+            for (int col=0; col<g.cols; ++col){
+                int bitInView = row*g.cols + col;
+                int byteOff = bitInView>>3;
+                if ((size_t)byteOff >= got){
+                    // unknown / unreadable slice
+                    RECT r={col*g.step, row*g.step, col*g.step+g_cell, row*g.step+g_cell};
+                    FillRect(mem,&r,g_bUnk); continue;
+                }
+                int val = get_bit(g_buf.data(), (uint64_t)bitInView);
+                uint64_t addr = g_view + byteOff;
+                int bib = bitInView & 7;
+                bool selByte = (addr==g_selAddr);
+                uint16_t ht = (bitInView<(int)heat.size())? heat[bitInView] : 0;
+                HBRUSH br = ht ? (ht>19?g_heat3 : ht>9?g_heat2 : g_heat1)
+                              : (val ? (selByte?g_b1s:g_b1) : (selByte?g_b0s:g_b0));
+                RECT r={col*g.step, row*g.step, col*g.step+g_cell, row*g.step+g_cell};
+                FillRect(mem,&r,br);
+                if (selByte && bib==g_selBit){
+                    HPEN pen=CreatePen(PS_SOLID,2,RGB(255,235,120)); HGDIOBJ op=SelectObject(mem,pen);
+                    HGDIOBJ ob=SelectObject(mem,GetStockObject(NULL_BRUSH));
+                    Rectangle(mem,r.left-1,r.top-1,r.right+1,r.bottom+1);
+                    SelectObject(mem,ob); SelectObject(mem,op); DeleteObject(pen);
+                }
+            }
+        }
+        // status strip inside the buffer
+        uint8_t sb=0; bool have = g_src->read(g_selAddr,&sb,1)==1;
+        char bits[9]; for(int k=0;k<8;++k) bits[k]= (sb>>(7-k))&1 ? '1':'0'; bits[8]=0;
+        char st1[220], st2[220];
+        snprintf(st1,sizeof(st1),"addr %011llX  bit %d = %d   byte 0x%02X  %s  '%c'",
+                 (unsigned long long)g_selAddr, g_selBit, have?((sb>>(7-g_selBit))&1):0,
+                 sb, bits, (sb>=32&&sb<127)?sb:'.');
+        snprintf(st2,sizeof(st2),"%s   view %011llX   cell %dpx  cols %d   frozen %zu   [%s]",
+                 g_src->writable()?"RW  click=TOGGLE":"RO  read-only",
+                 (unsigned long long)g_view, g_cell, g_cols, g_frozen.size(), g_src->kind());
+        SetTextColor(mem,RGB(120,200,255)); TextOutA(mem, 2, gh-STATUSH+2, st1,(int)strlen(st1));
+        SetTextColor(mem,RGB(160,160,170)); TextOutA(mem, 2, gh-STATUSH+20, st2,(int)strlen(st2));
+    }
+
+    BitBlt(hdc, g.area.left, g.area.top, gw, gh, mem, 0, 0, SRCCOPY);
+    SelectObject(mem,old); DeleteObject(bmp); DeleteDC(mem);
+}
+
+// map a client point to a bit; returns false if outside the cell grid
+static bool hit_cell(HWND h, int mx, int my, uint64_t& addr, int& bit){
+    Geo g=geo(h);
+    int lx=mx-g.area.left, ly=my-g.area.top;
+    if (lx<0||ly<0||my>g.cellsBottom) return false;
+    int col=lx/g.step, row=ly/g.step;
+    if (col>=g.cols) return false;
+    int bitInView=row*g.cols+col;
+    addr=g_view+(bitInView>>3); bit=bitInView&7;
+    return true;
+}
+
+static void scroll_rows(HWND h, int rows){
+    Geo g=geo(h); int64_t d=(int64_t)rows*g.bytesPerRow;
+    if (d<0 && (uint64_t)(-d)>g_view) g_view=0; else g_view=(uint64_t)((int64_t)g_view+d);
+    InvalidateRect(h,nullptr,FALSE);
+}
+
+LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp){
+    switch(msg){
+    case WM_CREATE: {
+        g_font=CreateFontA(14,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,
+                           CLIP_DEFAULT_PRECIS,DEFAULT_QUALITY,FIXED_PITCH|FF_MODERN,"Consolas");
+        g_bBg =CreateSolidBrush(RGB(18,18,22));
+        g_b0  =CreateSolidBrush(RGB(34,34,40));   g_b1 =CreateSolidBrush(RGB(40,130,220));
+        g_b0s =CreateSolidBrush(RGB(80,66,30));   g_b1s=CreateSolidBrush(RGB(245,195,45));
+        g_bUnk=CreateSolidBrush(RGB(48,40,40));
+        g_heat1=CreateSolidBrush(RGB(120,72,22)); g_heat2=CreateSolidBrush(RGB(205,120,32)); g_heat3=CreateSolidBrush(RGB(255,196,64));
+        HINSTANCE hi=((LPCREATESTRUCT)lp)->hInstance;
+        g_procs   =CreateWindowExA(WS_EX_CLIENTEDGE,"LISTBOX",nullptr,WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY|LBS_USETABSTOPS,0,0,10,10,h,(HMENU)ID_PROCS,hi,nullptr);
+        g_refresh =CreateWindowExA(0,"BUTTON","Refresh",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_REFRESH,hi,nullptr);
+        g_rw      =CreateWindowExA(0,"BUTTON","writable",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,0,0,10,10,h,(HMENU)ID_RW,hi,nullptr);
+        g_openfile=CreateWindowExA(0,"BUTTON","Open File",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_OPENFILE,hi,nullptr);
+        g_regions =CreateWindowExA(WS_EX_CLIENTEDGE,"LISTBOX",nullptr,WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY,0,0,10,10,h,(HMENU)ID_REGIONS,hi,nullptr);
+        g_type    =CreateWindowExA(0,"COMBOBOX",nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,0,0,10,220,h,(HMENU)ID_TYPE,hi,nullptr);
+        g_value   =CreateWindowExA(WS_EX_CLIENTEDGE,"EDIT","100",WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL,0,0,10,10,h,(HMENU)ID_VALUE,hi,nullptr);
+        g_first   =CreateWindowExA(0,"BUTTON","First Scan",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_FIRST,hi,nullptr);
+        g_cmp     =CreateWindowExA(0,"COMBOBOX",nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,0,0,10,160,h,(HMENU)ID_CMP,hi,nullptr);
+        g_next    =CreateWindowExA(0,"BUTTON","Next Scan",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_NEXT,hi,nullptr);
+        g_freeze  =CreateWindowExA(0,"BUTTON","Freeze+",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_FREEZE,hi,nullptr);
+        g_clearfrz=CreateWindowExA(0,"BUTTON","Clear frz",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_CLEARFRZ,hi,nullptr);
+        g_arecibo =CreateWindowExA(0,"BUTTON","Arecibo",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_ARECIBO,hi,nullptr);
+        g_seti    =CreateWindowExA(0,"BUTTON","SETI",WS_CHILD|WS_VISIBLE,0,0,10,10,h,(HMENU)ID_SETI,hi,nullptr);
+        g_results =CreateWindowExA(WS_EX_CLIENTEDGE,"LISTBOX",nullptr,WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY,0,0,10,10,h,(HMENU)ID_RESULTS,hi,nullptr);
+        HWND all[]={g_procs,g_refresh,g_rw,g_openfile,g_regions,g_type,g_value,g_first,g_cmp,g_next,g_freeze,g_clearfrz,g_arecibo,g_seti,g_results};
+        for(HWND c:all) set_font(c);
+        for(auto n:{"u8","u16","u32","u64","i8","i16","i32","i64","f32","f64","bits"}) SendMessageA(g_type,CB_ADDSTRING,0,(LPARAM)n);
+        SendMessage(g_type,CB_SETCURSEL,2,0); // u32
+        for(auto n:{"Exact","Unchanged","Changed","Increased","Decreased"}) SendMessageA(g_cmp,CB_ADDSTRING,0,(LPARAM)n);
+        SendMessage(g_cmp,CB_SETCURSEL,0,0);
+        refresh_procs();
+        SetTimer(h,ID_TIMER,33,nullptr);
+        return 0;
+    }
+    case WM_SIZE: {
+        RECT rc; GetClientRect(h,&rc); int W=rc.right,H=rc.bottom;
+        MoveWindow(g_procs,   4,20,  LEFTW-8,180,TRUE);
+        MoveWindow(g_refresh, 4,204, 80,24,TRUE);
+        MoveWindow(g_rw,      90,206, 80,20,TRUE);
+        MoveWindow(g_openfile,176,204,LEFTW-180,24,TRUE);
+        MoveWindow(g_regions, 4,252, LEFTW-8, H-256,TRUE);
+        int y1=H-BOTH+6;
+        MoveWindow(g_type,  RX+4,  y1, 64,220,TRUE);
+        MoveWindow(g_value, RX+72, y1, 150,24,TRUE);
+        MoveWindow(g_first, RX+228,y1, 96,24,TRUE);
+        MoveWindow(g_cmp,   RX+330,y1, 104,160,TRUE);
+        MoveWindow(g_next,  RX+440,y1, 90,24,TRUE);
+        MoveWindow(g_freeze,RX+536,y1, 84,24,TRUE);
+        MoveWindow(g_clearfrz,RX+624,y1,84,24,TRUE);
+        MoveWindow(g_arecibo, RX+716,y1,92,24,TRUE);
+        MoveWindow(g_seti,    RX+812,y1,72,24,TRUE);
+        MoveWindow(g_results, RX+4, y1+30, W-RX-8, BOTH-40,TRUE);
+        InvalidateRect(h,nullptr,FALSE);
+        return 0;
+    }
+    case WM_COMMAND: {
+        int id=LOWORD(wp), code=HIWORD(wp);
+        if(id==ID_REFRESH && code==BN_CLICKED) refresh_procs();
+        else if(id==ID_PROCS && code==LBN_DBLCLK){
+            int i=(int)SendMessage(g_procs,LB_GETCURSEL,0,0);
+            if(i>=0&&i<(int)g_procList.size()) attach_process(g_procList[i].pid, SendMessage(g_rw,BM_GETCHECK,0,0)==BST_CHECKED);
+        }
+        else if(id==ID_REGIONS && code==LBN_SELCHANGE){
+            int i=(int)SendMessage(g_regions,LB_GETCURSEL,0,0);
+            if(i>=0&&i<(int)g_regionList.size()) jump_to(g_regionList[i].base);
+        }
+        else if(id==ID_OPENFILE && code==BN_CLICKED){
+            char path[MAX_PATH]=""; OPENFILENAMEA ofn{}; ofn.lStructSize=sizeof(ofn); ofn.hwndOwner=h;
+            ofn.lpstrFilter="All files\0*.*\0"; ofn.lpstrFile=path; ofn.nMaxFile=MAX_PATH;
+            ofn.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST;
+            if(GetOpenFileNameA(&ofn)) attach_file(path, SendMessage(g_rw,BM_GETCHECK,0,0)==BST_CHECKED);
+        }
+        else if(id==ID_FIRST && code==BN_CLICKED) do_first();
+        else if(id==ID_NEXT  && code==BN_CLICKED) do_next();
+        else if(id==ID_FREEZE&& code==BN_CLICKED) do_freeze();
+        else if(id==ID_CLEARFRZ&&code==BN_CLICKED){ g_frozen.clear(); SetWindowTextA(g_freeze,"Freeze+"); }
+        else if(id==ID_ARECIBO && code==BN_CLICKED) do_arecibo(h,true);
+        else if(id==ID_SETI    && code==BN_CLICKED) do_seti(h,true);
+        else if(id==ID_RESULTS && code==LBN_DBLCLK){
+            int i=(int)SendMessage(g_results,LB_GETCURSEL,0,0);
+            if(i>=0&&i<(int)g_shown.size()){ jump_to(g_shown[i].addr); g_selBit=g_shown[i].bit; }
+        }
+        return 0;
+    }
+    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: {
+        uint64_t addr; int bit;
+        if(hit_cell(h,GET_X_LPARAM(lp),GET_Y_LPARAM(lp),addr,bit)){
+            g_selAddr=addr; g_selBit=bit;
+            if(msg==WM_LBUTTONDOWN && g_src && g_src->writable())
+                toggle_bit_src(*g_src,addr,bit);
+            InvalidateRect(h,nullptr,FALSE);
+        }
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        int d=GET_WHEEL_DELTA_WPARAM(wp)/WHEEL_DELTA;
+        scroll_rows(h,-d*3);
+        return 0;
+    }
+    case WM_KEYDOWN: {
+        switch(wp){
+            case VK_PRIOR: scroll_rows(h,-8); break;
+            case VK_NEXT:  scroll_rows(h, 8); break;
+            case VK_LEFT:  if(g_selBit>0)g_selBit--; else if(g_selAddr>0){g_selAddr--;g_selBit=7;} InvalidateRect(h,0,FALSE); break;
+            case VK_RIGHT: if(g_selBit<7)g_selBit++; else {g_selAddr++;g_selBit=0;} InvalidateRect(h,0,FALSE); break;
+            case VK_UP:    { Geo g=geo(h); uint64_t d=g.bytesPerRow; if(g_selAddr>=d)g_selAddr-=d; InvalidateRect(h,0,FALSE);} break;
+            case VK_DOWN:  { Geo g=geo(h); g_selAddr+=g.bytesPerRow; InvalidateRect(h,0,FALSE);} break;
+            case VK_SPACE: if(g_src&&g_src->writable()){toggle_bit_src(*g_src,g_selAddr,g_selBit);InvalidateRect(h,0,FALSE);} break;
+            case VK_OEM_PLUS: case VK_ADD:  if(g_cell<28)g_cell++; InvalidateRect(h,0,FALSE); break;
+            case VK_OEM_MINUS:case VK_SUBTRACT: if(g_cell>3)g_cell--; InvalidateRect(h,0,FALSE); break;
+        }
+        return 0;
+    }
+    case WM_TIMER:
+        if(wp==ID_TIMER){ apply_frozen(); if(g_src){ RECT rc;GetClientRect(h,&rc); RECT gr={RX,4,rc.right,rc.bottom-BOTH-6}; InvalidateRect(h,&gr,FALSE);} }
+        return 0;
+    case WM_ERASEBKGND: return 1;   // we paint everything (WS_CLIPCHILDREN)
+    case WM_PAINT: { PAINTSTRUCT ps; HDC hdc=BeginPaint(h,&ps); draw(h,hdc); EndPaint(h,&ps); return 0; }
+    case WM_DESTROY:
+        KillTimer(h,ID_TIMER);
+        DeleteObject(g_font); DeleteObject(g_bBg); DeleteObject(g_b0); DeleteObject(g_b1);
+        DeleteObject(g_b0s); DeleteObject(g_b1s); DeleteObject(g_bUnk);
+        DeleteObject(g_heat1); DeleteObject(g_heat2); DeleteObject(g_heat3);
+        PostQuitMessage(0); return 0;
+    }
+    return DefWindowProc(h,msg,wp,lp);
+}
+
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow){
+    WNDCLASSA wc{}; wc.lpfnWndProc=WndProc; wc.hInstance=hInst; wc.lpszClassName="bitforge_wnd";
+    wc.hCursor=LoadCursor(nullptr,IDC_ARROW); wc.style=CS_HREDRAW|CS_VREDRAW;
+    wc.hbrBackground=(HBRUSH)GetStockObject(BLACK_BRUSH);
+    RegisterClassA(&wc);
+    g_main=CreateWindowExA(0,"bitforge_wnd","bitforge  -  bit-level viewer/editor",
+        WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN, CW_USEDEFAULT,CW_USEDEFAULT,1300,760,
+        nullptr,nullptr,hInst,nullptr);
+    ShowWindow(g_main,nShow); UpdateWindow(g_main);
+    // Optional launch args:  <pid> | <file> | --arecibo | --seti
+    if (__argc>1){
+        const char* a=__argv[1];
+        if      (strcmp(a,"--arecibo")==0) do_arecibo(g_main,false);
+        else if (strcmp(a,"--seti")==0){ do_arecibo(g_main,false); do_seti(g_main,false); }
+        else {
+            bool numeric = *a && strspn(a,"0123456789")==strlen(a);
+            if (numeric) attach_process((uint32_t)atoi(a), false);
+            else         attach_file(a, false);
+        }
+    }
+    MSG m; while(GetMessage(&m,nullptr,0,0)){ TranslateMessage(&m); DispatchMessage(&m); }
+    return 0;
+}

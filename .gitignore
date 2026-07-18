@@ -1,0 +1,16 @@
+# build outputs
+build/
+cmbuild/
+out/
+
+# MSVC intermediates
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.exe
+
+# scratch / test artifacts
+toy_out.txt
+test.bin
