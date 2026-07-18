@@ -9,6 +9,7 @@
 #include "process_source.h"
 #include "disk_source.h"
 #include "scanner.h"
+#include "gpu.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -75,7 +76,9 @@ static int usage(){
            "  dset    <index> <hexaddr> <type> <value>\n"
            "  dpoke   <index> <hexaddr> <bit0-7> <0|1>\n"
            "  iread   <image> <hexaddr> <n>       (raw disk image file)\n"
-           "  ipoke   <image> <hexaddr> <bit0-7> <0|1>\n");
+           "  ipoke   <image> <hexaddr> <bit0-7> <0|1>\n"
+           "  gpu\n"
+           "  gpuscan <file> <bitpattern>          (GPU unaligned bit search)\n");
     return 1;
 }
 
@@ -181,6 +184,22 @@ int main(int argc, char** argv){
         printf("before: "); hexdump(ds,addr,1);
         bool ok=write_bit(ds,addr,bit,val); printf("write_bit -> %s\n", ok?"ok":"FAIL");
         printf("after:  "); hexdump(ds,addr,1); return 0;
+    }
+    // ---- GPU (CUDA analytics island) ----
+    if (cmd=="gpu"){ printf("%s\n", bf_gpu_name()); return 0; }
+    if (cmd=="gpuscan" && argc>=4){
+        if(!bf_gpu_present()){ printf("no GPU (built without CUDA, or no device)\n"); return 1; }
+#ifdef BITFORGE_CUDA
+        FileSource fs; if(!fs.open(argv[2],false)){ printf("open failed\n"); return 1; }
+        uint64_t n=fs.size(); if(n==0){ printf("empty file\n"); return 1; }
+        std::vector<uint8_t> buf((size_t)n); fs.read(0,buf.data(),(size_t)n);
+        uint64_t pat,mask; int nbits; if(!Scanner::parse_binary(argv[3],pat,mask,nbits)){ printf("bad bit pattern\n"); return 1; }
+        unsigned long long hits[64]; double km=0,kt=0;
+        long long c=bf_gpu_bitsearch(buf.data(),n,pat&mask,mask,nbits,hits,64,&km,&kt);
+        printf("GPU bit-search '%s' over %.1f MB: %lld hits  (kernel %.2f ms, total %.2f ms)\n",argv[3],n/1048576.0,c,km,kt);
+        int show=(int)(c<10?c:10); for(int i=0;i<show;++i) printf("  bit 0x%llX = byte 0x%llX .b%llu\n",hits[i],hits[i]>>3,hits[i]&7);
+#endif
+        return 0;
     }
     return usage();
 }

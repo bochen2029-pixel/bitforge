@@ -87,6 +87,29 @@ first (Windows guards mounted-volume sectors). Raw `\\.\PhysicalDriveN` access n
 `Mount-DiskImage`) so you never risk a real disk. `DiskSource::open_image` also opens a raw
 image file directly (no admin) through the same code path.
 
+## GPU acceleration (CUDA)
+
+The heavy compute — unaligned bit-search, value scan, per-block entropy — is the
+embarrassingly-parallel part, so it's offloaded to the GPU (`gpu/gpu_bitforge.cu`). Measured
+on a **GeForce RTX 4070 Ti SUPER**:
+
+| workload | GPU | CPU (1 thread) | speedup |
+|---|---|---|---|
+| unaligned 32-bit search, 16 MB (134M bit offsets) | 139 ms | 3348 ms | **24×** |
+| entropy map 128×128, 128 MB | 0.66 ms | 39 ms | **~60×** |
+| value scan u32, 128 MB | 0.71 ms | — | — |
+
+`build.bat` links CUDA automatically when `nvcc` is present (and copies the runtime DLL next
+to the exe so it's self-contained); without it, everything falls back to the CPU paths. The
+**structure map** computes its entropy on the GPU for in-memory spans (the header shows
+`GPU x.xx ms`), and the CLI exposes `gpu` / `gpuscan`:
+
+```
+build_gpu.bat                                    # standalone CPU-vs-GPU benchmark
+build\bitforge_cli.exe gpu                       # show the CUDA device
+build\bitforge_cli.exe gpuscan file.bin 1011?01  # GPU unaligned bit search
+```
+
 ## Build
 
 **One shot (MSVC):**
@@ -159,12 +182,11 @@ forensics on targets you own — not for defeating anti-cheat or DRM.
 
 ## Roadmap
 
-- **GPU stage** — upload a region snapshot to VRAM, compute popcount-density / entropy /
-  unaligned-bit search in a compute shader, and render a continuous-LOD zoom (whole
-  region → single bit). CUDA interop for the analytics island.
-- **More sources** — `PhysicalDrive` (sector-aligned disk), VHDX, a kernel-driver
-  `PhysicalMemory` source, and a PCILeech/DMA source, all behind `IByteSource`.
-- **Space-filling (Hilbert) layout** and a defrag-style region overview map.
+- **GPU rendering** — the analytics already run on CUDA (see above); next is moving the
+  *rendering* onto the GPU (CUDA↔GL interop) for a smooth continuous-LOD zoom, whole region
+  → single bit, instead of today's discrete Map→grid drill-down.
+- **Deepest sources** — a kernel-driver `PhysicalMemory` source and a PCILeech/DMA source,
+  behind the same `IByteSource`.
 
 ## Credits
 

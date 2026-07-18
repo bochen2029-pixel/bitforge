@@ -21,6 +21,7 @@
 #include "buffer_source.h"
 #include "arecibo.h"
 #include "alien.h"
+#include "gpu.h"
 #include <memory>
 #include <vector>
 #include <string>
@@ -378,7 +379,8 @@ static void exit_hunt(){ g_hunt=false; if(g_src) refresh_regions(); InvalidateRe
 // Render a whole region as a 2-D map where each cell is a block of bytes coloured by
 // local Shannon entropy, laid out along a Hilbert curve so nearby offsets stay spatially
 // adjacent (structure blooms into blobs). Click a cell to drill down into its bits.
-static bool     g_mapHilbert=true;
+static bool     g_mapHilbert=true, g_mapGpu=false;
+static double   g_mapMs=0;
 static const int MAP_N=128;
 static uint64_t g_mapBase=0, g_mapSpan=0, g_mapBlock=1;
 static std::vector<uint8_t> g_mapEnt;
@@ -405,9 +407,19 @@ static void enter_map(){
     g_mapBase=reg.base; g_mapSpan=reg.size;
     int cells=MAP_N*MAP_N; g_mapBlock=g_mapSpan/(uint64_t)cells; if(g_mapBlock<1) g_mapBlock=1;
     g_mapEnt.assign(cells,0);
-    size_t S=(size_t)(g_mapBlock<512?g_mapBlock:512); if(S<1)S=1;
-    std::vector<uint8_t> sb(S);
-    for(int i=0;i<cells;i++){ uint64_t a=g_mapBase+(uint64_t)i*g_mapBlock; size_t got=g_src->read(a,sb.data(),S); g_mapEnt[i]=buf_entropy(sb.data(),got); }
+    int sample=(int)(g_mapBlock<512?g_mapBlock:512); if(sample<1) sample=1;
+    g_mapGpu=false; g_mapMs=0;
+#ifdef BITFORGE_CUDA
+    if(bf_gpu_present() && g_mapSpan>0 && g_mapSpan<=(256ull<<20)){   // upload+entropy on GPU for in-memory spans
+        std::vector<uint8_t> whole((size_t)g_mapSpan,0);
+        size_t got=g_src->read(g_mapBase, whole.data(), (size_t)g_mapSpan);
+        if(got>0){ bf_gpu_entropy(whole.data(),(unsigned long long)got,g_mapBlock,cells,sample,g_mapEnt.data(),&g_mapMs); g_mapGpu=true; }
+    }
+#endif
+    if(!g_mapGpu){                                                   // CPU sampled path (also for huge disks)
+        std::vector<uint8_t> sb((size_t)sample);
+        for(int i=0;i<cells;i++){ uint64_t a=g_mapBase+(uint64_t)i*g_mapBlock; size_t got=g_src->read(a,sb.data(),(size_t)sample); g_mapEnt[i]=buf_entropy(sb.data(),got); }
+    }
     g_map=true; g_hunt=false; SetWindowTextA(g_main,"bitforge  ::  structure map");
 }
 static void exit_map(){ g_map=false; if(g_src) refresh_regions(); InvalidateRect(g_main,nullptr,FALSE); }
@@ -417,9 +429,13 @@ static void map_render(HDC mem,int gw,int gh){
     int ox,oy,cell; map_geo(gw,gh,ox,oy,cell); int px=cell*MAP_N;
     for(int d=0;d<MAP_N*MAP_N;d++){ int x,y; if(g_mapHilbert) hilbert_d2xy(MAP_N,(uint32_t)d,x,y); else { x=d%MAP_N; y=d/MAP_N; }
         int v=g_mapEnt[d]; RECT r={ox+x*cell,oy+y*cell,ox+x*cell+cell,oy+y*cell+cell}; FillRect(mem,&r,g_ramp[v*24/256]); }
-    char t[200]; SetTextColor(mem,RGB(200,220,255));
-    snprintf(t,sizeof(t),"MAP :: entropy  -  %s layout  -  base %011llX  span %.2f MB  block %llu B",
-        g_mapHilbert?"Hilbert":"linear",(unsigned long long)g_mapBase,g_mapSpan/1048576.0,(unsigned long long)g_mapBlock);
+    char t[220]; SetTextColor(mem,RGB(200,220,255));
+    if(g_mapGpu)
+        snprintf(t,sizeof(t),"MAP :: entropy  -  %s  -  GPU %.2f ms  -  base %011llX  span %.2f MB  block %llu B",
+            g_mapHilbert?"Hilbert":"linear",g_mapMs,(unsigned long long)g_mapBase,g_mapSpan/1048576.0,(unsigned long long)g_mapBlock);
+    else
+        snprintf(t,sizeof(t),"MAP :: entropy  -  %s  -  CPU  -  base %011llX  span %.2f MB  block %llu B",
+            g_mapHilbert?"Hilbert":"linear",(unsigned long long)g_mapBase,g_mapSpan/1048576.0,(unsigned long long)g_mapBlock);
     TextOutA(mem,8,6,t,(int)strlen(t));
     SetTextColor(mem,RGB(140,150,170));
     { const char* s="[H] Hilbert/linear     click a cell to drill into its bits     [Esc] exit"; TextOutA(mem,ox,oy+px+8,s,(int)strlen(s)); }
