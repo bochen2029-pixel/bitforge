@@ -122,6 +122,74 @@ in, popcount-density heat over a block of bits when zoomed out (continuous level
 No OpenGL context needed; the RGBA frame is blitted with `SetDIBitsToDevice`. Mouse wheel zooms
 to the cursor, drag pans, Esc exits.
 
+## GPU instant content search (`bf_search`)
+
+Everything-the-filename-indexer is a solved game; the open one is **content**. `bf_search`
+stages a whole directory tree into VRAM **once**, then answers every query with a fresh
+full-corpus sweep — no index, no per-query I/O, just the GPU detonating across every byte
+offset at once. The search kernel is deliberately written the fast-inverse-sqrt way: a
+**SWAR first-byte filter** (XOR-broadcast zero-byte trick) rejects 32 candidate offsets in
+~6 ALU ops, and **warp-scan hit aggregation** costs one atomic per warp. Measured on the
+RTX 4070 Ti SUPER (672 GB/s theoretical):
+
+| workload | throughput | vs peak |
+|---|---|---|
+| literal search, 12 GB sweep | **656 GB/s** (19.6 ms) | **97.6%** |
+| popcount density, 12 GB sweep | 649 GB/s (19.9 ms) | 96.5% |
+
+Live on a real corpus (10.52 GB, 21,343 files of `C:\Windows\System32` staged in VRAM):
+
+```
+query> This program cannot be run in DOS mode
+9477 hits    |  swept 10.52 GB in 17.40 ms  =  648.8 GB/s
+query> Microsoft
+1430569 hits |  swept 10.52 GB in 18.17 ms  =  621.5 GB/s   (count exact, list capped)
+```
+
+`'?'` matches any byte, `:i` toggles case-fold. Correctness is proven, not assumed:
+overlapping matches (`aa` in `aaaa` → 3), window-straddling needles, wildcards, case-fold,
+and a CPU cross-check on a real tree (GPU 1104 = CPU 1104, byte-for-byte same corpus).
+
+```
+build_search.bat
+build\bf_search.exe bench                         # saturation proof on your card
+build\bf_search.exe index C:\Windows\System32     # then type to search all of it
+```
+
+## Physical RAM (kernel driver)
+
+The deepest source: a tiny WDM kernel driver, [`driver/bitforge_km.c`](driver/bitforge_km.c),
+creates `\\.\BitforgePM` and answers four IOCTLs — enumerate the machine's physical RAM
+ranges (`MmGetPhysicalMemoryRanges`, so the MMIO holes are never touched), read physical
+bytes (`MmCopyMemory`), write them (`MmMapIoSpace` RMW), and translate a virtual address to
+its physical frame (`MmGetPhysicalAddress`, in the caller's context). `PhysMemSource` wraps
+it behind the same `IByteSource`, so the bit grid, scanner, entropy map, GPU zoom, and the
+SETI hunt all run over **raw physical memory** — the rung below `ReadProcessMemory`.
+
+```
+driver\build_driver.bat        # cl /kernel + link /DRIVER against the WDK
+driver\sign_driver.ps1         # self-signed test cert -> sign build\bitforge_km.sys
+bcdedit /set testsigning on    # one-time, then reboot (Secure Boot must be off)
+driver\install_driver.ps1      # sc create + start, then smoke-tests itself
+```
+
+```
+build\bitforge_cli.exe pmranges            # the machine's RAM ranges (holes skipped)
+build\bitforge_cli.exe pmselftest          # marker + one physical bit-flip, proven live
+build\bitforge_cli.exe pmseed              # plant+pin the Arecibo message, hold it
+build\bitforge_cli.exe pmhunt              # SETI-hunt ALL of physical RAM for it (GPU)
+build\bitforge_gui.exe --physmem           # the whole UI over physical memory
+```
+
+The end-to-end proof is the loop closed one level deeper than `--seti`: `pmseed` plants the
+Arecibo message in a pinned page, `pmhunt` sweeps every physical RAM range — GPU bit-searching
+each 16 MB chunk at *any* bit alignment — and finds the full 1679-bit transmission sitting at a
+**physical address**. `pmselftest` flips a single bit through the driver and watches it change
+through the ordinary virtual view of the same page.
+
+Test-signed drivers need `testsigning on` + one reboot, and a machine with Secure Boot off.
+Keep the driver pointed at RAM you own — a wrong physical *write* can corrupt anything.
+
 ## Build
 
 **One shot (MSVC):**
@@ -173,7 +241,8 @@ IByteSource
   ├─ ProcessSource   a live process (OpenProcess / VirtualQueryEx / RPM / WPM)
   ├─ BufferSource    a self-owned VirtualAlloc sandbox (the Arecibo scratch space)
   ├─ DiskSource      a raw disk \\.\PhysicalDriveN or a disk image (sector-aligned)
-  └─ (roadmap)       kernel PhysicalMemory · PCILeech/DMA
+  ├─ PhysMemSource   physical RAM via the bitforge_km kernel driver
+  └─ (roadmap)       PCILeech/DMA (FPGA hardware)
 ```
 
 The `bit_span` (get/set/toggle/popcount/**diff**), the address translator, the scanner,
@@ -182,8 +251,12 @@ and the GDI renderer are all shared.
 ```
 core/   byte_source.h  bit_span.h  address.h  source_ops.h
         file_source.h  process_source.*  buffer_source.h  scanner.*  arecibo.h
+        disk_source.*  physmem_source.*  gpu.h  alien.h
 cli/    bitforge_cli.cpp     console harness (proves the engine end-to-end)
 gui/    bitforge_gui.cpp     Win32 + GDI bit-grid viewer/editor
+gpu/    gpu_bitforge.cu      CUDA kernels (bit-search / value-scan / entropy / render)
+search/ bf_search.cu         GPU-resident instant content search + saturation bench
+driver/ bitforge_km.c        WDM physical-memory driver (+ build/sign/install scripts)
 target/ target_toy.cpp       a safe process to practice on
 arecibo/ gen_arecibo.py + the 1974 and 2026 message grids
 ```
@@ -198,8 +271,8 @@ forensics on targets you own — not for defeating anti-cheat or DRM.
 - **GPU rendering** — done: a CUDA kernel renders every pixel for the continuous-LOD zoom
   viewer (see above). A future refinement is CUDA↔GL/Vulkan interop to skip the device→host
   copy for even higher throughput.
-- **Deepest sources** — a kernel-driver `PhysicalMemory` source and a PCILeech/DMA source,
-  behind the same `IByteSource`.
+- **Deepest sources** — done: the kernel-driver `PhysicalMemory` source (see above). Still
+  out there: a PCILeech/DMA source (needs FPGA hardware), behind the same `IByteSource`.
 
 ## Credits
 
